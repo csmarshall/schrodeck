@@ -1,0 +1,88 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  STATICCHECK_VERSION: v0.8.1
+
+jobs:
+  checks:
+    name: checks (linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Detector self-tests (each detector seen to fail on known-bad input)
+        run: tools/ci/selftest.sh
+      - name: MPL-2.0 headers
+        run: tools/ci/check-headers.sh
+      - name: gofmt
+        run: tools/ci/check-gofmt.sh
+      - name: Leak scan
+        env:
+          LEAK_SCAN_EXTRA: ${{ secrets.LEAK_SCAN_EXTRA }}
+        run: tools/ci/leak-scan.sh
+      - name: go vet
+        run: |
+          go vet ./...
+          (cd deckformat && go vet ./...)
+      - name: staticcheck
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@"$STATICCHECK_VERSION"
+          staticcheck ./...
+          (cd deckformat && staticcheck ./...)
+      - name: Core is OS-free (ADR 0018)
+        run: go run ./tools/archcheck/cmd/archcheck -mode core -dir .
+      - name: deckformat imports no schrodeck package (ADR 0031)
+        run: go run ./tools/archcheck/cmd/archcheck -mode boundary -dir deckformat -forbid .
+      - name: Ports match contract A (ADR 0024)
+        run: go run ./tools/portcheck/cmd/portcheck -doc docs/contracts/os-connector.md -src internal/ports
+      - name: Cross-build for every OS we keep possible
+        run: |
+          goos_list=$(go run ./tools/archcheck/cmd/archcheck -print-goos)
+          if [ -z "$goos_list" ]; then
+            echo "archcheck -print-goos returned no GOOS" >&2
+            exit 1
+          fi
+          for goos in $goos_list; do
+            GOOS=$goos go build ./...
+            (cd deckformat && GOOS=$goos go build ./...)
+          done
+      - name: Tests (Linux)
+        run: |
+          go test -race ./...
+          (cd deckformat && go test -race ./...)
+
+  macos:
+    name: tests (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Tests (macOS)
+        run: |
+          go test -race ./...
+          (cd deckformat && go test -race ./...)

@@ -1,0 +1,1 @@
+{"schema_version":1,"command":"doctor","ok":false,"data":{"checks":[{"id":"A1","status":"pass"},{"id":"A2","status":"fail","detail":"broken on purpose"}]}}

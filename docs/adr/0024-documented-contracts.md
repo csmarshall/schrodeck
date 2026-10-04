@@ -34,7 +34,7 @@ Five contracts, indexed in [docs/contracts/README.md](../contracts/README.md), e
 - Good: an Elgato update breaks B or C visibly (the guard refuses and `doctor` names the failing probe) instead of silently corrupting profiles.
 - Good: mixed schrodeck versions sharing one store are an explicit, tested case (D), not an accident.
 - Bad: more documents to keep true. Mitigations: same-PR rule for ours; evidence-only rule for Elgato's.
-- D was extracted into `docs/contracts/store-format.md` after the review (F22), as the single definition of store fields. E still lives in ADR 0018 and moves into `docs/contracts/` when the code defines it.
+- D was extracted into `docs/contracts/store-format.md` after the review (F22), as the single definition of store fields. E moved into [cli-json.md](../contracts/cli-json.md) when M0 defined it (issue #3).
 - Risk: A's port boundaries may still be wrong for Windows in ways only a real Windows connector will reveal.
 
 ## Alternatives considered

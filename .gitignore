@@ -16,3 +16,9 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .DS_Store
+
+# Local build output
+/schrodeck
+
+# Command logs (the global rules tee every command run on a real machine to a timestamped .log); they can hold profile names, host ids and paths
+*.log
