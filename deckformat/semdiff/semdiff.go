@@ -131,6 +131,16 @@ func renderPathSegs(segments []seg) string {
 	return b.String()
 }
 
+// RenderPath renders segments exactly as Change.Path is rendered, so
+// RenderPath(ParsePath(p)) == p.
+func RenderPath(segs []Segment) string {
+	out := make([]seg, len(segs))
+	for i, s := range segs {
+		out[i] = seg{name: s.Name, idx: s.Index, isIdx: s.IsIndex}
+	}
+	return renderPathSegs(out)
+}
+
 // Segment is one step of a rendered path: a member name or an array index.
 type Segment struct {
 	Name    string // member name, empty if IsIndex

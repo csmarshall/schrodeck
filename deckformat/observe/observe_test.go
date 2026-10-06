@@ -926,3 +926,42 @@ func TestHeaderSaysProfileNumbersArePerReport(t *testing.T) {
 		t.Fatalf("header lacks the profile-N note:\n%s", md)
 	}
 }
+
+func TestPrefsDeviceKeysOfUnknownShapeAreMasked(t *testing.T) {
+	odd := "Raw-" + "QQ77" + "RR88"
+	mk := func(devices any) *jsondoc.Value {
+		v, err := jsondoc.FromAny(map[string]any{"Devices": devices})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	check := func(name string, before, after *jsondoc.Value, want ...string) {
+		t.Helper()
+		b := take(t, fixture.XL(), before, t0)
+		a := take(t, fixture.XL(), after, t0.Add(time.Minute))
+		rep, err := Compare(name, b, a, redactor(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+		md := rep.Markdown()
+		if strings.Contains(md, "QQ77") || strings.Contains(rep.EvidenceRow(), "QQ77") {
+			t.Errorf("%s: the raw prefs key reached the report:\n%s", name, md)
+		}
+		for _, w := range want {
+			if !strings.Contains(md, w) {
+				t.Errorf("%s: report lacks %q:\n%s", name, w, md)
+			}
+		}
+	}
+	// A raw entry of that shape changing, next to a plain word key (control).
+	check("leaf",
+		mk(map[string]any{odd: "v1", "ESDSettings": "a"}),
+		mk(map[string]any{odd: "v2", "ESDSettings": "b"}),
+		`Devices.Raw-<id> | modified | "v1" | "v2"`, `Devices.ESDSettings | modified | "a" | "b"`)
+	// A Before/After that carries the whole Devices object.
+	check("whole",
+		mk("none"),
+		mk(map[string]any{odd: "v", "ESDSettings": "a"}),
+		`"Raw-<id>"`, `"ESDSettings"`)
+}

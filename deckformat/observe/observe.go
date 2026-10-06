@@ -350,7 +350,12 @@ func Compare(name string, before, after *Snapshot, r *redact.Redactor) (Report, 
 		if c.Page != "" {
 			c.Where = ps.pageWhere(c.Where, c.Page)
 		}
-		c.Profile, c.Where, c.Path = r.String(c.Profile), r.String(c.Where), r.String(c.Path)
+		if c.Where == "prefs" {
+			c.Path = prefsPath(c.Path, r)
+		} else {
+			c.Path = r.String(c.Path)
+		}
+		c.Profile, c.Where = r.String(c.Profile), r.String(c.Where)
 		c.Profile, c.Where, c.Path = ps.String(c.Profile), ps.String(c.Where), ps.String(c.Path)
 		c.Before, c.After = ps.String(c.Before), ps.String(c.After)
 		// Page and SlotPath carry raw page ids and served only to resolve the change.
@@ -584,10 +589,46 @@ type renderer struct {
 	before, after *Snapshot
 	r             *redact.Redactor
 	memo          map[*jsondoc.Value]*jsondoc.Value // raw document → redacted copy
+	memoPrefs     map[*jsondoc.Value]*jsondoc.Value // raw prefs → redacted copy with Devices keys masked
 }
 
 func newRenderer(before, after *Snapshot, r *redact.Redactor) *renderer {
-	return &renderer{before: before, after: after, r: r, memo: map[*jsondoc.Value]*jsondoc.Value{}}
+	return &renderer{before: before, after: after, r: r, memo: map[*jsondoc.Value]*jsondoc.Value{}, memoPrefs: map[*jsondoc.Value]*jsondoc.Value{}}
+}
+
+// redactedPrefs is the redacted copy of a prefs document, with the member
+// names of its Devices object also passed through KeyName: those keys are the
+// app's device keys and entries of unknown shape (U5, U7), which may carry
+// identifiers outside the @(n)[…] form.
+func (rd *renderer) redactedPrefs(v *jsondoc.Value) *jsondoc.Value {
+	if red, ok := rd.memoPrefs[v]; ok {
+		return red
+	}
+	red := rd.redacted(v).Clone()
+	if devs := red.Get(prefsDevices); devs != nil && devs.Kind() == jsondoc.Object {
+		for i, m := range devs.Members() {
+			devs.RenameMember(i, rd.r.KeyName(m.Name))
+		}
+	}
+	rd.memoPrefs[v] = red
+	return red
+}
+
+// prefsDevices is the prefs member whose member names are device keys.
+const prefsDevices = "Devices"
+
+// prefsPath masks the Devices member name in a prefs change's path the same
+// way redactedPrefs does in the values, then applies String to the rest. An
+// unparseable path is blanked (fail closed).
+func prefsPath(path string, r *redact.Redactor) string {
+	segs, err := semdiff.ParsePath(path)
+	if err != nil {
+		return redact.Redacted
+	}
+	if len(segs) >= 2 && !segs[0].IsIndex && segs[0].Name == prefsDevices && !segs[1].IsIndex {
+		segs[1].Name = r.KeyName(segs[1].Name)
+	}
+	return r.String(semdiff.RenderPath(segs))
 }
 
 func (rd *renderer) redacted(v *jsondoc.Value) *jsondoc.Value {
@@ -654,7 +695,7 @@ func (rd *renderer) roots(s *Snapshot, folder string, c *semdiff.Change) []rootP
 	switch c.Where {
 	case "prefs":
 		if s.Prefs != nil {
-			return []rootPair{pair(s.Prefs)}
+			return []rootPair{{s.Prefs, rd.redactedPrefs(s.Prefs)}}
 		}
 		return nil
 	case "profile":
