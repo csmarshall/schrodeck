@@ -300,6 +300,35 @@ func TestDistinctSerialsGetDistinctPlaceholders(t *testing.T) {
 	}
 }
 
+// I6: the same Serials set gives the same mapping whatever order the decks are
+// first met in, and in whatever order or case the set was listed.
+func TestPlaceholderNumberingDoesNotDependOnSightingOrder(t *testing.T) {
+	first, second := realSerial, "ZZ99"+"YY88XX"
+	deck := func(serial string) string { return "@(1)[4057/143/" + serial + "]" }
+	build := func(serials ...string) *Redactor {
+		r, err := New(Options{Serials: serials})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	a := build(first, second)
+	b := build(strings.ToLower(second), strings.ToLower(first)) // another order and case
+	// a meets the decks one way round, b the other.
+	gotA := []string{a.String(deck(first)), a.String(deck(second))}
+	gotB := []string{b.String(deck(second)), b.String(deck(first))}
+	if gotA[0] != gotB[1] || gotA[1] != gotB[0] {
+		t.Fatalf("the mapping depends on sighting order: a=%v b(second,first)=%v", gotA, gotB)
+	}
+	if gotA[0] == gotA[1] {
+		t.Fatalf("two decks collapsed into %s", gotA[0])
+	}
+	// A serial outside the list is numbered after the listed ones, by first sight.
+	if got := a.String(deck("QQ11" + "RR22SS")); got != "@(1)[4057/143/<deck3>]" {
+		t.Errorf("unlisted serial = %s, want <deck3>", got)
+	}
+}
+
 // Known-bad for the export-side check: two member names that redaction maps to
 // one name. The export must fail, name the file, and write nothing.
 func TestExportRefusesManifestThatStopsParsing(t *testing.T) {

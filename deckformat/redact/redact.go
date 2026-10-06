@@ -10,8 +10,9 @@
 // What it cannot catch: a serial split or reformatted across characters (for
 // example "AB12-CD34EF" for "AB12CD34EF"), a name spelled phonetically or
 // abbreviated, and anything in image pixels (images are replaced wholesale, not
-// scrubbed). Numbered placeholders (<deck2>) and pseudonymized UUIDs are
-// assigned per Redactor, in the order values are first seen.
+// scrubbed). Numbered placeholders (<deck2>) are fixed by Options.Serials (sorted,
+// case-folded), so the same set gives the same mapping; a serial outside it, and
+// pseudonymized UUIDs, are numbered per Redactor in the order first seen.
 package redact
 
 import (
@@ -129,8 +130,9 @@ type Redactor struct {
 	literals []literal
 	serials  []*regexp.Regexp
 
-	// Each distinct serial gets its own placeholder, numbered in order of first
-	// appearance: <deck>, <deck2>, <deck3>. Two decks therefore never collapse
+	// Each distinct serial gets its own placeholder: <deck>, <deck2>, <deck3>,
+	// assigned to Options.Serials in sorted order by New, then to any serial first
+	// seen outside that list in order of first appearance. Two decks therefore never collapse
 	// into one member name, and a serial seen bare maps like the id carrying it.
 	mu    sync.Mutex
 	decks map[string]string
@@ -248,6 +250,16 @@ func New(o Options) (*Redactor, error) {
 			return nil, fmt.Errorf("redact: %q is too short to redact safely", n)
 		}
 		r.serials = append(r.serials, regexp.MustCompile(`(?i)`+regexp.QuoteMeta(n)))
+	}
+	// Number the listed serials up front, in case-folded sorted order, so one
+	// Serials set always gives one mapping, whatever order the decks are met in.
+	// A serial first seen outside the list is numbered after these.
+	listed := append([]string(nil), o.Serials...)
+	sort.Slice(listed, func(i, j int) bool { return strings.ToLower(listed[i]) < strings.ToLower(listed[j]) })
+	for _, n := range listed {
+		if n != "" {
+			r.deckFor(n)
+		}
 	}
 	// Longest first, so "alice-mbp" is replaced before "alice".
 	sort.SliceStable(r.literals, func(i, j int) bool {
