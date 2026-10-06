@@ -8,11 +8,7 @@
 // what observing the app needs. Semantic mode compares the normalized forms
 // of contract C, which is what "did the user change anything" needs.
 //
-// Path grammar: a path is a sequence of member names and array indices joined injectively.
-// A member name is rendered as-is if it contains only alphanumerics and underscore; otherwise
-// it is quoted as ["…"] with internal " and \ escaped. Array indices are rendered as [i].
-// Between segments: no prefix for the first segment; subsequent member names are prefixed with ".";
-// array indices have no prefix dot (e.g., "a[0].b" for nested access, 'a.["[0]"]' for member named "[0]").
+// Path grammar: a path is a sequence of member names and array indices, joined so that two different paths never render alike. A member name is written as is when it is non-empty and contains none of . [ ] " (so "Settings", "a b" and "é" are bare); otherwise it is quoted as ["…"] with " and \ escaped inside. An array index is written [i]. Member names after the first segment are prefixed with ".", array indices are not: "a[0].b" for a member b of the first item of a, and a.["[0]"] for a member of a that is literally named "[0]".
 package semdiff
 
 import (
@@ -129,6 +125,29 @@ func renderPathSegs(segments []seg) string {
 // Values compares two JSON trees and returns one change per differing leaf.
 // where and profileName label every change.
 func Values(profileName, where string, a, b *jsondoc.Value) []Change {
+	return values(profileName, where, a, b, rawEqual)
+}
+
+// scalarEqual decides whether two scalars of the same kind are the same value.
+type scalarEqual func(a, b *jsondoc.Value) bool
+
+// rawEqual compares scalars as stored: 1.50 and 1.5 differ.
+func rawEqual(a, b *jsondoc.Value) bool { return bytes.Equal(a.Raw(), b.Raw()) }
+
+// canonicalEqual compares scalars by their RFC 8785 form, the form the
+// normalized hash uses, so a spelling the hash ignores is not a change either.
+// A scalar with no canonical form (a number JCS cannot carry exactly) falls
+// back to its stored spelling.
+func canonicalEqual(a, b *jsondoc.Value) bool {
+	ca, errA := a.Canonical()
+	cb, errB := b.Canonical()
+	if errA != nil || errB != nil {
+		return rawEqual(a, b)
+	}
+	return bytes.Equal(ca, cb)
+}
+
+func values(profileName, where string, a, b *jsondoc.Value, equal scalarEqual) []Change {
 	var out []Change
 	emit := func(path []seg, kind Kind, x, y *jsondoc.Value) {
 		c := Change{Profile: profileName, Where: where, Path: renderPathSegs(path), Kind: kind}
@@ -140,11 +159,11 @@ func Values(profileName, where string, a, b *jsondoc.Value) []Change {
 		}
 		out = append(out, c)
 	}
-	diffValues(nil, a, b, emit)
+	diffValues(nil, a, b, emit, equal)
 	return out
 }
 
-func diffValues(path []seg, a, b *jsondoc.Value, emit func([]seg, Kind, *jsondoc.Value, *jsondoc.Value)) {
+func diffValues(path []seg, a, b *jsondoc.Value, emit func([]seg, Kind, *jsondoc.Value, *jsondoc.Value), equal scalarEqual) {
 	switch {
 	case a == nil && b == nil:
 		return
@@ -163,7 +182,7 @@ func diffValues(path []seg, a, b *jsondoc.Value, emit func([]seg, Kind, *jsondoc
 		seen := map[string]bool{}
 		for _, m := range a.Members() {
 			seen[m.Name] = true
-			diffValues(append(path[:len(path):len(path)], seg{name: m.Name}), m.Value, b.Get(m.Name), emit)
+			diffValues(append(path[:len(path):len(path)], seg{name: m.Name}), m.Value, b.Get(m.Name), emit, equal)
 		}
 		for _, m := range b.Members() {
 			if !seen[m.Name] {
@@ -180,10 +199,10 @@ func diffValues(path []seg, a, b *jsondoc.Value, emit func([]seg, Kind, *jsondoc
 			if i < len(bi) {
 				y = bi[i]
 			}
-			diffValues(append(path[:len(path):len(path)], seg{idx: i, isIdx: true}), x, y, emit)
+			diffValues(append(path[:len(path):len(path)], seg{idx: i, isIdx: true}), x, y, emit, equal)
 		}
 	default:
-		if !bytes.Equal(a.Raw(), b.Raw()) {
+		if !equal(a, b) {
 			emit(path, Modified, a, b)
 		}
 	}
@@ -208,7 +227,7 @@ func humanPage(label string) string {
 // pageChanges compares two page manifests and moves the key slot out of the
 // path into Where: "page 1 › key 3,1" + "Settings.path".
 // It works on the structured path representation to avoid re-splitting collisions.
-func pageChanges(profileName, page string, a, b *jsondoc.Value) []Change {
+func pageChanges(profileName, page string, a, b *jsondoc.Value, equal scalarEqual) []Change {
 	var out []Change
 
 	// Walk through differences and rebuild paths from segments
@@ -216,10 +235,10 @@ func pageChanges(profileName, page string, a, b *jsondoc.Value) []Change {
 		// Check if this is a Controllers[i].Actions.<slot> path
 		if len(path) >= 3 &&
 			path[0].name == "Controllers" &&
-			path[0].isIdx == false &&
-			path[1].isIdx == true &&
+			!path[0].isIdx &&
+			path[1].isIdx &&
 			path[2].name == "Actions" &&
-			path[2].isIdx == false {
+			!path[2].isIdx {
 
 			// Extract the controller index
 			ctlIdx := path[1].idx
@@ -275,7 +294,7 @@ func pageChanges(profileName, page string, a, b *jsondoc.Value) []Change {
 		out = append(out, c)
 	}
 
-	diffValues(nil, a, b, emit)
+	diffValues(nil, a, b, emit, equal)
 	return out
 }
 
@@ -328,17 +347,17 @@ func docChanges(name string, a, b map[string]*jsondoc.Value) []Change {
 	var out []Change
 	for _, path := range unionKeys(a, b) {
 		if path == "manifest.json" {
-			out = append(out, Values(name, "profile", a[path], b[path])...)
+			out = append(out, values(name, "profile", a[path], b[path], canonicalEqual)...)
 			continue
 		}
 		label := strings.TrimSuffix(path, "/manifest.json")
-		out = append(out, pageChanges(name, humanPage(label), a[path], b[path])...)
+		out = append(out, pageChanges(name, humanPage(label), a[path], b[path], canonicalEqual)...)
 	}
 	return out
 }
 
 func rawChanges(name string, before, after *profile.Profile) ([]Change, error) {
-	out := Values(name, "profile", before.Manifest, after.Manifest)
+	out := values(name, "profile", before.Manifest, after.Manifest, rawEqual)
 
 	la, err := normhash.PageLabels(before)
 	if err != nil {
@@ -376,7 +395,7 @@ func rawChanges(name string, before, after *profile.Profile) ([]Change, error) {
 		if pg := after.Pages[k]; pg != nil {
 			b = pg.Manifest
 		}
-		out = append(out, pageChanges(name, humanPage(label)+" ("+k+")", a, b)...)
+		out = append(out, pageChanges(name, humanPage(label)+" ("+k+")", a, b, rawEqual)...)
 	}
 	out = append(out, fileChanges(name, before.Files(), after.Files())...)
 	return out, nil

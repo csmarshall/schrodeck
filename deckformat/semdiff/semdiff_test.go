@@ -11,6 +11,7 @@ import (
 
 	"github.com/csmarshall/schrodeck/deckformat/fixture"
 	"github.com/csmarshall/schrodeck/deckformat/jsondoc"
+	"github.com/csmarshall/schrodeck/deckformat/normhash"
 	"github.com/csmarshall/schrodeck/deckformat/profile"
 )
 
@@ -212,5 +213,51 @@ func TestPathEscaping(t *testing.T) {
 	expected := `x.["a\"b\\c"]`
 	if cs[0].Path != expected {
 		t.Errorf("escaping path: got %q, want %q", cs[0].Path, expected)
+	}
+}
+
+// Semantic mode must report nothing for profiles the normalized hash calls
+// equal: a number or string spelled differently, or members in another order,
+// is not a user change. Raw mode still shows the spelling, which is what
+// observing the app needs.
+func TestSemanticIgnoresSpellingTheHashIgnores(t *testing.T) {
+	bs := string(rune(92))
+	pairs := []struct{ name, a, b string }{
+		{"number spelling", `{"gain":1.50}`, `{"gain":1.5}`},
+		{"escape vs literal", `{"label":"caf` + bs + `u00e9"}`, `{"label":"café"}`},
+		{"member order", `{"a":1,"b":2}`, `{"b":2,"a":1}`},
+	}
+	for _, c := range pairs {
+		t.Run(c.name, func(t *testing.T) {
+			before, after := fixture.XL(), fixture.XL()
+			before.Pages[0].Buttons[0].Settings = c.a
+			after.Pages[0].Buttons[0].Settings = c.b
+			pa, pb := loadP(t, before), loadP(t, after)
+			ha, err := normhash.Hash(pa)
+			if err != nil {
+				t.Fatal(err)
+			}
+			hb, err := normhash.Hash(pb)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if ha != hb {
+				t.Fatalf("premise broken: the pair no longer hashes equal, so the test says nothing about semdiff")
+			}
+			sem, err := Profiles(pa, pb, Semantic)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(sem) != 0 {
+				t.Fatalf("Semantic reported changes on a hash-equal pair:\n%s", render(sem))
+			}
+			raw, err := Profiles(pa, pb, Raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if c.name != "member order" && len(raw) == 0 {
+				t.Fatal("Raw reported nothing, so the pair does not differ as stored and the test cannot see the Semantic comparison")
+			}
+		})
 	}
 }
