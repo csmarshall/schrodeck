@@ -7,6 +7,8 @@ package profile
 import (
 	"bytes"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -196,5 +198,64 @@ func TestLoadAllIsolatesBrokenProfiles(t *testing.T) {
 	}
 	if len(res.Profiles) != 1 || len(res.Errors) != 1 || len(res.Skipped) != 1 {
 		t.Fatalf("profiles %d, errors %d, skipped %v", len(res.Profiles), len(res.Errors), res.Skipped)
+	}
+}
+
+func TestLoadRefusesSymlinks(t *testing.T) {
+	fp := fixture.XL()
+	dir := t.TempDir()
+	if err := fixture.WriteTo(dir, fp.FS()); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(t.TempDir(), "outside.png")
+	if err := os.WriteFile(outside, []byte("not part of the profile"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, fp.Folder(), "Images", "x.png")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Skipf("cannot create symlinks here: %v", err)
+	}
+	_, err := Load(os.DirFS(dir), fp.Folder())
+	var ue *UnexpectedFileError
+	if !errors.As(err, &ue) || ue.Path != "Images/x.png" {
+		t.Fatalf("symlinked image: err = %v, want UnexpectedFileError for Images/x.png", err)
+	}
+}
+
+func TestJunkNamedDirectoriesAreStillChecked(t *testing.T) {
+	for _, extra := range []string{
+		"Images~/secret.bin",
+		"Profiles/ABC/Images~/secret.bin",
+		".DS_Store/secret.bin",
+	} {
+		fp := fixture.XL()
+		fp.Extra = map[string][]byte{extra: []byte("x")}
+		_, err := Load(fp.FS(), fp.Folder())
+		var ue *UnexpectedFileError
+		if !errors.As(err, &ue) {
+			t.Errorf("%s: err = %v, want UnexpectedFileError", extra, err)
+		}
+	}
+}
+
+// A junk-named page folder is an ordinary page folder: it is loaded, not
+// skipped, so its manifest is parsed and its files are part of the profile.
+func TestJunkNamedPageFolderIsLoadedNotSkipped(t *testing.T) {
+	fp := fixture.XL()
+	fp.Extra = map[string][]byte{"Profiles/X~/manifest.json": []byte(`{"Controllers":[{"Type":"Keypad"}],"Icon":"","Name":""}`)}
+	p := load(t, fp)
+	if p.Pages["x~"] == nil {
+		t.Fatal("page folder X~ was skipped")
+	}
+	if _, ok := p.Files()["Profiles/X~/manifest.json"]; !ok {
+		t.Error("X~'s manifest is missing from Files()")
+	}
+	if len(p.Junk) != 0 {
+		t.Errorf("Junk = %v, want none", p.Junk)
+	}
+	fp.Extra["Profiles/X~/stray.txt"] = []byte("x")
+	var ue *UnexpectedFileError
+	if _, err := Load(fp.FS(), fp.Folder()); !errors.As(err, &ue) {
+		t.Errorf("stray file inside X~: err = %v, want UnexpectedFileError", err)
 	}
 }

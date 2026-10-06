@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/json/jsontext"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -34,16 +35,21 @@ var opaqueMembers = map[string]bool{"Settings": true}
 var wildcardMembers = map[string]bool{"Actions": true}
 
 // SchemaOf computes the schema over a set of profiles. Profiles with
-// different Version values are an error: one fingerprint cannot describe two
-// formats.
+// different Version values are an error, as are an empty list and a profile
+// without a Version: one fingerprint cannot describe two formats, and a
+// fingerprint of nothing must never be mistaken for a baseline.
 func SchemaOf(ps []*Profile) (Schema, error) {
 	keys := map[string]bool{}
 	patterns := map[string]bool{}
-	version := ""
+	if len(ps) == 0 {
+		return Schema{}, errors.New("no profiles to fingerprint")
+	}
+	version := ps[0].Version()
 	for _, p := range ps {
-		if version == "" {
-			version = p.Version()
-		} else if p.Version() != version {
+		if p.Version() == "" {
+			return Schema{}, fmt.Errorf("%s: manifest has no Version", p.Folder)
+		}
+		if p.Version() != version {
 			return Schema{}, fmt.Errorf("profiles have different Version values (%q, %q)", version, p.Version())
 		}
 		keyPaths("manifest:", p.Manifest, keys)
@@ -92,7 +98,9 @@ func keyPaths(prefix string, v *jsondoc.Value, out map[string]bool) {
 			}
 		case jsondoc.Array:
 			for _, it := range v.Items() {
-				walk(path+"[]", it, parent)
+				// Array items are not key slots, even under Actions (a
+				// multi-action's child actions): their names stay literal.
+				walk(path+"[]", it, "")
 			}
 		}
 	}

@@ -130,16 +130,17 @@ func Load(fsys fs.FS, folder string) (*Profile, error) {
 			return nil
 		}
 		rel := strings.TrimPrefix(full, folder+"/")
-		if IsJunk(d.Name()) {
+		// Junk names apply to files only: a junk-named directory is walked
+		// like any other, so its contents stay subject to the allow-list.
+		if !d.IsDir() && IsJunk(d.Name()) {
 			p.Junk = append(p.Junk, rel)
-			if d.IsDir() {
-				return fs.SkipDir
-			}
 			return nil
 		}
 		parts := strings.Split(rel, "/")
 		kind := classify(parts, d.IsDir())
-		if kind == unexpected {
+		// Only directories and regular files are profile content: a symlink
+		// could read outside the profile and a FIFO or device could hang.
+		if kind == unexpected || (!d.IsDir() && !d.Type().IsRegular()) {
 			return &UnexpectedFileError{Profile: folder, Path: rel}
 		}
 		if kind == allowedDir {
