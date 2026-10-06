@@ -5,10 +5,14 @@
 package normhash
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"os"
+	"sort"
 	"strings"
 	"testing"
+	"testing/fstest"
 
 	"github.com/csmarshall/schrodeck/deckformat/fixture"
 	"github.com/csmarshall/schrodeck/deckformat/profile"
@@ -312,5 +316,183 @@ func TestGoldenCoversRelabelMissingAndOther(t *testing.T) {
 	// Verify golden value
 	if got := hash(t, p); got != goldenRelabelMissingOther {
 		t.Fatalf("Hash(fixtureWithRelabelMissingOther()) = %s, reference says %s", got, goldenRelabelMissingOther)
+	}
+}
+
+// --- review fixes (PR #18) ----------------------------------------------------
+
+// reverseTopLevelMembers re-emits a compact JSON object with its top-level
+// members in reverse sorted order, values untouched. The loader (P12) only
+// requires that a manifest round-trips byte for byte, so this is a valid
+// manifest an app could write.
+func reverseTopLevelMembers(t *testing.T, data []byte) []byte {
+	t.Helper()
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(data, &members); err != nil {
+		t.Fatal(err)
+	}
+	names := make([]string, 0, len(members))
+	for n := range members {
+		names = append(names, n)
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(names)))
+	var buf bytes.Buffer
+	buf.WriteByte('{')
+	for i, n := range names {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		k, _ := json.Marshal(n)
+		buf.Write(k)
+		buf.WriteByte(':')
+		buf.Write(members[n])
+	}
+	buf.WriteByte('}')
+	return buf.Bytes()
+}
+
+func loadFS(t *testing.T, fsys fstest.MapFS, folder string) *profile.Profile {
+	t.Helper()
+	p, err := profile.Load(fsys, folder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// I1: JCS (contract C step 3) is what makes member order irrelevant.
+func TestMemberOrderDoesNotCount(t *testing.T) {
+	base := fixture.XL()
+	reordered := base.FS()
+	for name, f := range reordered {
+		if strings.HasSuffix(name, "/manifest.json") {
+			f.Data = reverseTopLevelMembers(t, f.Data)
+		}
+	}
+	if bytes.Equal(reordered[base.Folder()+"/manifest.json"].Data, base.FS()[base.Folder()+"/manifest.json"].Data) {
+		t.Fatal("the reordering did not change the manifest bytes; the test cannot see JCS working")
+	}
+	got, err := Hash(loadFS(t, reordered, base.Folder()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := hash(t, base); got != want {
+		t.Fatalf("manifests differing only in member order hash differently: %s vs %s", got, want)
+	}
+}
+
+// I2: relabeling is scoped to action Settings values (contract C step 2).
+func TestPageUUIDOutsideSettingsIsNotRelabeled(t *testing.T) {
+	withTitle := func(p fixture.Profile) fixture.Profile {
+		p.Pages[0].Buttons[1].Title = strings.ToUpper(p.Pages[1].ID)
+		return p
+	}
+	a := withTitle(fixture.XL())
+	b := withTitle(fixture.CopyOf(fixture.XL(), "copy"))
+	if hash(t, a) == hash(t, b) {
+		t.Fatal("a Title equal to a page UUID was relabeled; relabeling must stay inside action Settings")
+	}
+}
+
+// m1: paths are NFC. "e" + U+0301 (NFD) must hash like U+00E9 (NFC); the
+// strings are built from bytes so no editor or tool can normalize the source.
+func TestOtherPageFolderIsNFC(t *testing.T) {
+	const nfd, nfc = "e\xcc\x81", "\xc3\xa9"
+	withFolder := func(name string) string {
+		p := fixture.XL()
+		p.Extra = map[string][]byte{
+			"Profiles/" + name + "/manifest.json": []byte(`{"Controllers":[],"Icon":"","Name":""}`),
+		}
+		h, err := Hash(loadP(t, p))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return h
+	}
+	if withFolder(nfd) != withFolder(nfc) {
+		t.Fatal("a page folder named NFD hashes differently from the same name in NFC")
+	}
+}
+
+// m2: HashDocs sorts, so callers need not.
+func TestHashDocsSortsByPath(t *testing.T) {
+	docs, err := Normalize(loadP(t, fixture.XL()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := HashDocs(docs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rev := make([]Doc, len(docs))
+	for i, d := range docs {
+		rev[len(docs)-1-i] = d
+	}
+	got, err := HashDocs(rev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatal("HashDocs depends on the order of its input")
+	}
+}
+
+func TestHashDocsRejectsDuplicatePathsAndNilValues(t *testing.T) {
+	docs, err := Normalize(loadP(t, fixture.XL()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dup := append(append([]Doc{}, docs...), docs[0])
+	if _, err := HashDocs(dup); !errors.Is(err, profile.ErrMalformed) {
+		t.Errorf("duplicate path: err = %v, want ErrMalformed", err)
+	}
+	nilValue := append(append([]Doc{}, docs...), Doc{Path: "zzz/manifest.json"})
+	if _, err := HashDocs(nilValue); !errors.Is(err, profile.ErrMalformed) {
+		t.Errorf("nil Value: err = %v, want ErrMalformed", err)
+	}
+}
+
+// m3, m4: structural errors in the page lists. Each case edits the top
+// manifest of the base fixture by string replacement and must fail with the
+// stated error; the replacement is checked to have applied, so a case cannot
+// pass by testing an unchanged profile.
+func TestPageListErrors(t *testing.T) {
+	base := fixture.XL()
+	a1, a2, d0 := base.Pages[0].ID, base.Pages[1].ID, base.Default.ID
+	cases := []struct {
+		name     string
+		from, to string
+		want     error
+	}{
+		{"non-string Pages.Default", `"Default":"` + d0 + `"`, `"Default":7`, profile.ErrMalformed},
+		{"non-string Pages.Pages entry", `"` + a2 + `"]`, `7]`, profile.ErrMalformed},
+		{"duplicate in Pages.Pages", `"` + a2 + `"]`, `"` + a1 + `"]`, profile.ErrMalformed},
+		{"Default also in Pages.Pages", `"Default":"` + d0 + `"`, `"Default":"` + a1 + `"`, profile.ErrMalformed},
+		{"Pages.Pages entry without a folder", `"` + a2 + `"]`, `"` + a2 + `","aaaaaaaa-0000-4000-8000-0000000000ee"]`, ErrDanglingPage},
+		{"Pages.Default without a folder", `"Default":"` + d0 + `"`, `"Default":"aaaaaaaa-0000-4000-8000-0000000000ee"`, ErrDanglingPage},
+	}
+	for _, c := range cases {
+		fsys := base.FS()
+		path := base.Folder() + "/manifest.json"
+		edited := strings.Replace(string(fsys[path].Data), c.from, c.to, 1)
+		if edited == string(fsys[path].Data) {
+			t.Fatalf("%s: the edit did not apply", c.name)
+		}
+		fsys[path] = &fstest.MapFile{Data: []byte(edited)}
+		p, err := profile.Load(fsys, base.Folder())
+		if err != nil {
+			t.Fatalf("%s: Load: %v", c.name, err)
+		}
+		if _, err := Hash(p); !errors.Is(err, c.want) {
+			t.Errorf("%s: err = %v, want %v", c.name, err, c.want)
+		}
+	}
+}
+
+// Hashes are lower-case hex (contract C step 4).
+func TestHashIsLowerCaseHex(t *testing.T) {
+	h := hash(t, fixture.XL())
+	if len(h) != 64 || h != strings.ToLower(h) {
+		t.Fatalf("hash = %q, want 64 lower-case hex digits", h)
 	}
 }

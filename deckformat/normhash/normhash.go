@@ -6,6 +6,13 @@
 // § normalized hash (docs/contracts/profile-format.md), norm_version 1. The
 // hash must change on a real user edit and on nothing else. The definition
 // lives in contract C; this package implements it and nothing more.
+//
+// Hash and Normalize expect a profile that is ALREADY in placeholder form
+// (contract C step 3: {{HOME}}, variables, {{DEVICE}}) when it is compared
+// with a stored tree. Putting a local copy into placeholder form is the
+// caller's job (ADR 0006); this package does not do it, so hashing a raw
+// local profile and a stored tree gives different results for a reason that
+// is not a user edit.
 package normhash
 
 import (
@@ -58,10 +65,13 @@ type options struct {
 
 var full = options{strip: true, relabelPages: true, hashImages: true}
 
-// Normalize returns the profile's normalized manifests, sorted by path.
+// Normalize returns the profile's normalized manifests, sorted by path. The
+// profile must already be in placeholder form (see the package doc).
 func Normalize(p *profile.Profile) ([]Doc, error) { return normalize(p, full) }
 
-// Hash returns the normalized hash (hex sha256).
+// Hash returns the normalized hash (lower-case hex sha256). The profile must
+// already be in placeholder form (see the package doc) before it is compared
+// with a stored tree.
 func Hash(p *profile.Profile) (string, error) {
 	docs, err := Normalize(p)
 	if err != nil {
@@ -71,10 +81,20 @@ func Hash(p *profile.Profile) (string, error) {
 }
 
 // HashDocs hashes normalized docs: sha256 over "<path>\x00<hex sha256 of the
-// JCS bytes>\n" lines sorted bytewise by path (contract C step 4).
+// JCS bytes>\n" lines sorted bytewise by path (contract C step 4). It sorts
+// internally, so docs may come in any order; a duplicate path or a nil Value
+// is profile.ErrMalformed.
 func HashDocs(docs []Doc) (string, error) {
 	lines := make([]string, 0, len(docs))
+	seen := make(map[string]bool, len(docs))
 	for _, d := range docs {
+		if d.Value == nil {
+			return "", fmt.Errorf("%s: nil document value: %w", d.Path, profile.ErrMalformed)
+		}
+		if seen[d.Path] {
+			return "", fmt.Errorf("%s: path appears twice: %w", d.Path, profile.ErrMalformed)
+		}
+		seen[d.Path] = true
 		c, err := d.Value.Canonical()
 		if err != nil {
 			return "", fmt.Errorf("%s: %w", d.Path, err)
@@ -97,6 +117,11 @@ func PageLabels(p *profile.Profile) (map[string]string, error) {
 	order, err := p.PageOrder()
 	if err != nil {
 		return nil, err
+	}
+	if def := p.Manifest.Lookup("Pages", "Default"); def != nil {
+		if _, ok := def.Str(); !ok {
+			return nil, fmt.Errorf("%s: Pages.Default is not a string: %w", p.Folder, profile.ErrMalformed)
+		}
 	}
 	labels := map[string]string{}
 	for i, id := range order {

@@ -40,6 +40,8 @@ jobs:
         env:
           LEAK_SCAN_EXTRA: ${{ secrets.LEAK_SCAN_EXTRA }}
         run: tools/ci/leak-scan.sh
+      - name: Go golden hashes match the independent Python reference
+        run: tools/ci/check-normhash-reference.sh
       - name: go vet
         run: |
           go vet ./...

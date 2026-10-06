@@ -10,6 +10,10 @@ contract rather than merely agreeing with itself. It handles the subset the
 fixtures use (no floats; ASCII member names), for which RFC 8785 equals
 json.dumps(sort_keys=True, separators=(",", ":"), ensure_ascii=False).
 
+Exits non-zero, printing nothing on stdout, for the structural errors contract
+C step 2 names: a page without a folder, a duplicate in Pages.Pages,
+Pages.Default also in Pages.Pages, or a non-string Default or entry.
+
 Usage: refhash.py <profile-folder>
 """
 import hashlib
@@ -52,10 +56,21 @@ def main(folder):
     pages_dir = os.path.join(folder, "Profiles")
     folders = {name.lower(): name for name in os.listdir(pages_dir)}
 
+    listed = top["Pages"]["Pages"]
+    default = top["Pages"]["Default"]
+    if not isinstance(default, str) or not all(isinstance(p, str) for p in listed):
+        raise SystemExit("error: non-string Pages.Default or Pages.Pages entry")
     labels = {}
-    for i, pid in enumerate(top["Pages"]["Pages"]):
+    for i, pid in enumerate(listed):
+        if pid.lower() in labels:
+            raise SystemExit("error: page %s listed twice in Pages.Pages" % pid)
         labels[pid.lower()] = "page/%d" % i
-    labels[top["Pages"]["Default"].lower()] = "default"
+    if default.lower() in labels:
+        raise SystemExit("error: Pages.Default is also in Pages.Pages")
+    labels[default.lower()] = "default"
+    for low in labels:
+        if low not in folders:
+            raise SystemExit("error: page %s has no folder" % low)
     for low, name in folders.items():
         labels.setdefault(low, "other/" + low)
 
