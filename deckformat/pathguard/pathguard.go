@@ -19,21 +19,30 @@ import (
 // ErrInside means a write target lies inside a protected root.
 var ErrInside = errors.New("pathguard: target is inside a protected directory")
 
+// ErrUnresolvable means the path cannot be located without guessing (a dangling
+// symlink, or a ".." after a component that does not exist yet), so it is
+// refused rather than allowed.
+var ErrUnresolvable = errors.New("pathguard: path cannot be resolved")
+
 // ErrNotName means a name that must be a single path element is not one.
 var ErrNotName = errors.New("pathguard: not a single path element")
 
 // RefuseInside returns ErrInside if target is, or would be created, inside any
-// of roots. Both sides go through Resolve, which follows the path the way the
-// kernel does (symlinks and "../" segments in order, the missing tail appended),
-// so neither a symlinked output directory nor a "../" after a symlink can reach
-// a root. The comparison ignores letter case: macOS and Windows file systems
-// usually do, and refusing a few more paths than necessary is the safe
-// direction.
+// of roots. The path is first resolved the way the kernel does (see Resolve),
+// then inside-ness is decided by file IDENTITY: every existing ancestor of the
+// target, from the deepest one up to the top, is compared with each root using
+// os.SameFile (device and inode). Identity is the authority because spelling is
+// not: firmlinks (/System/Volumes/Data/...), case folding that strings.ToLower
+// does not reproduce, and Unicode normalization all name one directory in
+// several ways. A cheap case-insensitive string comparison runs first and can
+// only add refusals, never remove them. A root that does not exist yet is
+// compared by string only, since nothing can alias a directory that is absent.
 func RefuseInside(target string, roots ...string) error {
 	t, err := Resolve(target)
 	if err != nil {
 		return err
 	}
+	var chain []os.FileInfo // created lazily: only needed when a root exists
 	for _, root := range roots {
 		if root == "" {
 			continue
@@ -45,8 +54,46 @@ func RefuseInside(target string, roots ...string) error {
 		if within(strings.ToLower(r), strings.ToLower(t)) {
 			return fmt.Errorf("%w: %s is inside %s", ErrInside, target, root)
 		}
+		ri, err := os.Stat(r)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if chain == nil {
+			if chain, err = ancestors(t); err != nil {
+				return err
+			}
+		}
+		for _, a := range chain {
+			if os.SameFile(a, ri) {
+				return fmt.Errorf("%w: %s is inside %s", ErrInside, target, root)
+			}
+		}
 	}
 	return nil
+}
+
+// ancestors returns the identity of every existing directory on the way from p
+// up to the top, p itself included when it exists.
+func ancestors(p string) ([]os.FileInfo, error) {
+	var out []os.FileInfo
+	for cur := p; ; {
+		fi, err := os.Stat(cur)
+		switch {
+		case err == nil:
+			out = append(out, fi)
+		case errors.Is(err, fs.ErrNotExist):
+		default:
+			return nil, err
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return out, nil
+		}
+		cur = parent
+	}
 }
 
 // SingleName returns ErrNotName unless name is one path element: not empty,
@@ -71,8 +118,10 @@ func within(root, target string) bool {
 // it is met, and ".." removes the previous PHYSICAL component. Lexically
 // cleaning first would be wrong, because "link/../x" is the parent of link's
 // target, not the parent of link. The part of p that does not exist yet is
-// appended as written. A dangling symlink is an error: a write through it would
-// create its target, and Resolve cannot say where that is. Callers that write
+// appended as written. Two things are ErrUnresolvable: a dangling symlink (a
+// write through it would create its target, and Resolve cannot say where that
+// is) and a ".." after a component that does not exist yet (the kernel would
+// resume following real symlinks after it, so a lexical guess can be wrong). Callers that write
 // must write to the returned path, not to p, so the check and the write cannot
 // disagree.
 func Resolve(p string) (string, error) {
@@ -95,6 +144,9 @@ func Resolve(p string) (string, error) {
 		case ".":
 			continue
 		case "..":
+			if missing {
+				return "", fmt.Errorf("%w: %s: \"..\" after a component that does not exist", ErrUnresolvable, p)
+			}
 			cur = filepath.Dir(cur)
 			continue
 		}
@@ -103,7 +155,7 @@ func Resolve(p string) (string, error) {
 			if _, err := os.Lstat(next); err == nil {
 				real, err := filepath.EvalSymlinks(next)
 				if err != nil {
-					return "", fmt.Errorf("pathguard: %s: %w", next, err)
+					return "", fmt.Errorf("%w: %s: %w", ErrUnresolvable, next, err)
 				}
 				cur = real
 				continue

@@ -6,6 +6,12 @@
 // observations and fixtures from real machines can be shared (ADR 0031).
 // Redaction errs toward removing too much. It is a first pass: anything that
 // will be published still gets a human review and the repository leak scan.
+//
+// What it cannot catch: a serial split or reformatted across characters (for
+// example "AB12-CD34EF" for "AB12CD34EF"), a name spelled phonetically or
+// abbreviated, and anything in image pixels (images are replaced wholesale, not
+// scrubbed). Numbered placeholders (<deck2>) and pseudonymized UUIDs are
+// assigned per Redactor, in the order values are first seen.
 package redact
 
 import (
@@ -16,13 +22,16 @@ import (
 	"image"
 	"image/color"
 	"image/png"
+	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"unicode"
 
 	"github.com/csmarshall/schrodeck/deckformat/jsondoc"
 	"github.com/csmarshall/schrodeck/deckformat/pathguard"
@@ -42,11 +51,64 @@ var (
 	// Vendor and product are public model ids and are kept.
 	deviceID     = regexp.MustCompile(`@\((\d+)\)\[(\d+)/(\d+)/[^\]\s"]+\]`)
 	deviceSerial = regexp.MustCompile(`@\(\d+\)\[\d+/\d+/([^\]\s"]+)\]`)
-	// Home directories: macOS, Linux, Windows (with either separator).
-	homeDir = regexp.MustCompile(`(/Users/|/home/|[A-Za-z]:\\Users\\|[A-Za-z]:/Users/)[^/\\\s"'<>]+`)
-	// Member names whose values are secrets whatever they contain.
-	secretName = regexp.MustCompile(`(?i)(token|secret|passw|api[_-]?key|auth|cookie|session)`)
+	// Home directories: macOS, Linux, Windows (with either separator), and the
+	// same path with its separators percent-encoded.
+	homeDir    = regexp.MustCompile(`(/Users/|/home/|[A-Za-z]:\\Users\\|[A-Za-z]:/Users/)[^/\\\s"'<>]+`)
+	homeDirEnc = regexp.MustCompile(`((?i:%2F)(?:Users|home)(?i:%2F))[^%/\\\s"'<>&]+`)
+	// Member names whose values are secrets whatever they contain. "pin" and
+	// "pass" are matched as whole words of the name (userPIN, pin_code), not as
+	// substrings, so "mapping" and "bypass" are left alone.
+	secretSubstring = regexp.MustCompile(`(?i)(token|secret|passw|api[_-]?key|private[_-]?key|access[_-]?key|auth|cookie|session|credential|bearer)`)
+	// A query parameter: ?key=value, &key=value or ;key=value.
+	queryParam = regexp.MustCompile(`([?&;])([^=&#\s"'<>]+)=([^&#\s"'<>]*)`)
+	uuidRe     = regexp.MustCompile(`(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
+	// An already-redacted serial, so redacting twice does not renumber it.
+	deckPlaceholder = regexp.MustCompile(`^<deck\d*>$`)
 )
+
+// isSecretName reports whether a member name says its value is a secret.
+func isSecretName(name string) bool {
+	if secretSubstring.MatchString(name) {
+		return true
+	}
+	for _, w := range nameWords(name) {
+		switch w {
+		case "pin", "pass", "passcode":
+			return true
+		}
+	}
+	return false
+}
+
+// nameWords splits a member name into lower-case words at separators and
+// camelCase boundaries: "userPIN" gives user, pin; "api_key" gives api, key.
+func nameWords(name string) []string {
+	var words []string
+	var cur []rune
+	flush := func() {
+		if len(cur) > 0 {
+			words = append(words, strings.ToLower(string(cur)))
+			cur = nil
+		}
+	}
+	rs := []rune(name)
+	for i, c := range rs {
+		if !unicode.IsLetter(c) && !unicode.IsDigit(c) {
+			flush()
+			continue
+		}
+		if unicode.IsUpper(c) && len(cur) > 0 {
+			prev := rs[i-1]
+			nextLower := i+1 < len(rs) && unicode.IsLower(rs[i+1])
+			if unicode.IsLower(prev) || unicode.IsDigit(prev) || (unicode.IsUpper(prev) && nextLower) {
+				flush()
+			}
+		}
+		cur = append(cur, c)
+	}
+	flush()
+	return words
+}
 
 // Options lists identifiers known to the caller (from the host connector).
 // Serials are the serial parts of every device id the caller has seen (prefs
@@ -68,6 +130,7 @@ type Redactor struct {
 	// into one member name, and a serial seen bare maps like the id carrying it.
 	mu    sync.Mutex
 	decks map[string]string
+	uuids map[string]string
 }
 
 // deckFor returns the placeholder for a serial, assigning the next one on first
@@ -75,6 +138,9 @@ type Redactor struct {
 func (r *Redactor) deckFor(serial string) string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if deckPlaceholder.MatchString(serial) {
+		return serial
+	}
 	key := strings.ToLower(serial)
 	if ph, ok := r.decks[key]; ok {
 		return ph
@@ -87,6 +153,55 @@ func (r *Redactor) deckFor(serial string) string {
 	return ph
 }
 
+// uuidFor returns the synthetic UUID (lower-case) for a real one, numbered in
+// order of first appearance and shaped like the synthetic fixtures'.
+func (r *Redactor) uuidFor(real string) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	key := strings.ToLower(real)
+	if syn, ok := r.uuids[key]; ok {
+		return syn
+	}
+	syn := fmt.Sprintf("aaaaaaaa-0000-4000-8000-%012x", len(r.uuids)+1)
+	r.uuids[key] = syn
+	return syn
+}
+
+// pseudonymizeUUIDs replaces every UUID in s by its synthetic one, consistently
+// and case-insensitively. The synthetic id keeps the case of the original,
+// except when onDisk is set (a folder name), which is always upper-case as the
+// app writes them.
+func (r *Redactor) pseudonymizeUUIDs(s string, onDisk bool) string {
+	return uuidRe.ReplaceAllStringFunc(s, func(m string) string {
+		syn := r.uuidFor(m)
+		if onDisk || m != strings.ToLower(m) {
+			return strings.ToUpper(syn)
+		}
+		return syn
+	})
+}
+
+func (r *Redactor) pseudonymizeValue(v *jsondoc.Value) {
+	switch v.Kind() {
+	case jsondoc.String:
+		s, _ := v.Str()
+		if out := r.pseudonymizeUUIDs(s, false); out != s {
+			v.SetString(out)
+		}
+	case jsondoc.Object:
+		for i, m := range v.Members() {
+			if out := r.pseudonymizeUUIDs(m.Name, false); out != m.Name {
+				v.RenameMember(i, out)
+			}
+			r.pseudonymizeValue(m.Value)
+		}
+	case jsondoc.Array:
+		for _, it := range v.Items() {
+			r.pseudonymizeValue(it)
+		}
+	}
+}
+
 type literal struct {
 	re          *regexp.Regexp
 	placeholder string
@@ -95,7 +210,7 @@ type literal struct {
 // New builds a redactor. Names shorter than 3 characters are refused rather
 // than redacted everywhere they occur as a substring.
 func New(o Options) (*Redactor, error) {
-	r := &Redactor{decks: map[string]string{}}
+	r := &Redactor{decks: map[string]string{}, uuids: map[string]string{}}
 	add := func(names []string, placeholder string) error {
 		for _, n := range names {
 			if n == "" {
@@ -104,7 +219,14 @@ func New(o Options) (*Redactor, error) {
 			if len(n) < 3 {
 				return fmt.Errorf("redact: %q is too short to redact safely", n)
 			}
-			r.literals = append(r.literals, literal{regexp.MustCompile(`(?i)` + regexp.QuoteMeta(n)), placeholder})
+			// The name as written, and as it appears percent-encoded in a URL.
+			seen := map[string]bool{}
+			for _, form := range []string{n, url.PathEscape(n), url.QueryEscape(n)} {
+				if !seen[form] {
+					seen[form] = true
+					r.literals = append(r.literals, literal{regexp.MustCompile(`(?i)` + regexp.QuoteMeta(form)), placeholder})
+				}
+			}
 		}
 		return nil
 	}
@@ -155,6 +277,18 @@ func (r *Redactor) String(s string) string {
 		return "@(" + m[1] + ")[" + m[2] + "/" + m[3] + "/" + r.deckFor(deviceSerial.FindStringSubmatch(id)[1]) + "]"
 	})
 	s = homeDir.ReplaceAllString(s, "${1}"+User)
+	s = homeDirEnc.ReplaceAllString(s, "${1}"+User)
+	s = queryParam.ReplaceAllStringFunc(s, func(q string) string {
+		m := queryParam.FindStringSubmatch(q)
+		key := m[2]
+		if dec, err := url.QueryUnescape(key); err == nil {
+			key = dec
+		}
+		if isSecretName(key) {
+			return m[1] + m[2] + "=" + Redacted
+		}
+		return q
+	})
 	for _, l := range r.literals {
 		s = l.re.ReplaceAllString(s, l.placeholder)
 	}
@@ -176,16 +310,34 @@ func (r *Redactor) redactInPlace(v *jsondoc.Value) {
 	switch v.Kind() {
 	case jsondoc.String:
 		s, _ := v.Str()
+		// JSON embedded in a string (plugins store settings that way) is parsed,
+		// redacted as a document and put back.
+		if t := strings.TrimSpace(s); len(t) > 1 && (t[0] == '{' || t[0] == '[') {
+			if inner, err := jsondoc.Parse([]byte(s)); err == nil && (inner.Kind() == jsondoc.Object || inner.Kind() == jsondoc.Array) {
+				r.redactInPlace(inner)
+				v.SetString(string(inner.Encode()))
+				return
+			}
+		}
 		if red := r.String(s); red != s {
 			v.SetString(red)
 		}
 	case jsondoc.Object:
+		// A {"name": "token", "value": ...} pair: the name says what the value is.
+		pairSecret := false
+		for _, m := range v.Members() {
+			if k := strings.ToLower(m.Name); k == "name" || k == "key" {
+				if s, ok := m.Value.Str(); ok && isSecretName(s) {
+					pairSecret = true
+				}
+			}
+		}
 		for i, m := range v.Members() {
 			if red := r.String(m.Name); red != m.Name {
 				v.RenameMember(i, red)
 			}
-			if secretName.MatchString(m.Name) && m.Value.Kind() != jsondoc.Object && m.Value.Kind() != jsondoc.Array {
-				m.Value.SetString(Redacted)
+			if isSecretName(m.Name) || (pairSecret && strings.EqualFold(m.Name, "value")) {
+				r.blank(m.Value)
 				continue
 			}
 			r.redactInPlace(m.Value)
@@ -194,6 +346,26 @@ func (r *Redactor) redactInPlace(v *jsondoc.Value) {
 		for _, it := range v.Items() {
 			r.redactInPlace(it)
 		}
+	}
+}
+
+// blank replaces every scalar under v, at any depth, by Redacted. Member names
+// are still redacted, since they can carry identifiers too.
+func (r *Redactor) blank(v *jsondoc.Value) {
+	switch v.Kind() {
+	case jsondoc.Object:
+		for i, m := range v.Members() {
+			if red := r.String(m.Name); red != m.Name {
+				v.RenameMember(i, red)
+			}
+			r.blank(m.Value)
+		}
+	case jsondoc.Array:
+		for _, it := range v.Items() {
+			r.blank(it)
+		}
+	default:
+		v.SetString(Redacted)
 	}
 }
 
@@ -243,14 +415,22 @@ func SyntheticPNG(original []byte) []byte {
 var ErrOutputExists = errors.New("redact: output directory is not empty")
 
 // ExportFixture writes a redacted copy of p to outDir/<folder>: manifests
-// redacted, images replaced by SyntheticPNG. folder must be a single path
-// element, outDir must be empty or absent, and the final target must not lie
-// inside sourceRoot (the folder p was read from), so an export can never write
-// into the app's own data (pathguard resolves symlinks and "../").
+// redacted, UUIDs pseudonymized (in manifests, folder names and paths), images
+// replaced by SyntheticPNG. folder must be a single path element, outDir must be
+// empty or absent, and the final target must not lie inside sourceRoot (the
+// folder p was read from), so an export can never write into the app's own data.
+//
+// The guard decides by file identity on the path the kernel will reach, and the
+// files are written through an os.Root opened on that exact directory, so a
+// relative name inside the export cannot step out of it. One race remains that
+// no path check can close: someone with write access renaming an ANCESTOR of
+// outDir between the guard and the open. The identity re-check after the open
+// narrows that window; it does not remove it.
 func ExportFixture(p *profile.Profile, r *Redactor, sourceRoot, outDir, folder string) error {
 	if err := pathguard.SingleName(folder); err != nil {
 		return err
 	}
+	outFolder := r.pseudonymizeUUIDs(folder, true)
 	// Resolve outDir the way the kernel will (never filepath.Abs, which cleans
 	// "link/../x" into a different place), check the final target, and write to
 	// exactly that resolved path so the check and the write cannot disagree.
@@ -258,7 +438,7 @@ func ExportFixture(p *profile.Profile, r *Redactor, sourceRoot, outDir, folder s
 	if err != nil {
 		return err
 	}
-	finalTarget, err := pathguard.Resolve(filepath.Join(resolvedOut, folder))
+	finalTarget, err := pathguard.Resolve(filepath.Join(resolvedOut, outFolder))
 	if err != nil {
 		return err
 	}
@@ -286,21 +466,54 @@ func ExportFixture(p *profile.Profile, r *Redactor, sourceRoot, outDir, folder s
 			if err != nil {
 				return fmt.Errorf("%s: %w", rel, err)
 			}
-			data = r.Value(doc).Encode()
+			doc = r.Value(doc)
+			r.pseudonymizeValue(doc)
+			data = doc.Encode()
 			if _, err := jsondoc.Parse(data); err != nil {
 				return fmt.Errorf("redact: %s does not parse after redaction, nothing written: %w", rel, err)
 			}
 		} else {
 			data = SyntheticPNG(data)
 		}
-		redacted[rel] = data
+		redacted[r.pseudonymizeUUIDs(rel, true)] = data
 	}
-	for _, rel := range rels {
-		target := filepath.Join(finalTarget, filepath.FromSlash(rel))
-		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-			return err
+	outRels := make([]string, 0, len(redacted))
+	for rel := range redacted {
+		outRels = append(outRels, rel)
+	}
+	sort.Strings(outRels)
+
+	if err := os.MkdirAll(finalTarget, 0o755); err != nil {
+		return err
+	}
+	root, err := os.OpenRoot(finalTarget)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	// The directory opened must be the directory that was checked, and must
+	// still not be inside the source.
+	opened, err := root.Stat(".")
+	if err != nil {
+		return err
+	}
+	checked, err := os.Stat(finalTarget)
+	if err != nil {
+		return err
+	}
+	if !os.SameFile(opened, checked) {
+		return fmt.Errorf("redact: %s changed while the export was starting", finalTarget)
+	}
+	if err := pathguard.RefuseInside(finalTarget, sourceRoot); err != nil {
+		return err
+	}
+	for _, rel := range outRels {
+		if dir := path.Dir(rel); dir != "." {
+			if err := root.MkdirAll(filepath.FromSlash(dir), 0o755); err != nil {
+				return err
+			}
 		}
-		if err := os.WriteFile(target, redacted[rel], 0o644); err != nil {
+		if err := root.WriteFile(filepath.FromSlash(rel), redacted[rel], 0o644); err != nil {
 			return err
 		}
 	}

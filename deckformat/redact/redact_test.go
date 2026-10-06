@@ -7,11 +7,13 @@ package redact
 import (
 	"bytes"
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
+	"testing/fstest"
 
 	"github.com/csmarshall/schrodeck/deckformat/fixture"
 	"github.com/csmarshall/schrodeck/deckformat/jsondoc"
@@ -162,8 +164,8 @@ func TestExportRefusesUnsafeTargets(t *testing.T) {
 	p, _ := profile.Load(fixture.XL().FS(), fixture.XL().Folder())
 	r := newR(t)
 	src := t.TempDir()
-	if err := ExportFixture(p, r, src, filepath.Join(src, "inside"), "F.sdProfile"); err == nil {
-		t.Fatal("export into the source tree was allowed")
+	if err := ExportFixture(p, r, src, filepath.Join(src, "inside"), "F.sdProfile"); !errors.Is(err, pathguard.ErrInside) {
+		t.Fatalf("export into the source tree: %v", err)
 	}
 	full := t.TempDir()
 	if err := os.WriteFile(filepath.Join(full, "x"), []byte("x"), 0o644); err != nil {
@@ -308,5 +310,278 @@ func TestExportRefusesManifestThatStopsParsing(t *testing.T) {
 	}
 	if entries, _ := os.ReadDir(out); len(entries) != 0 {
 		t.Fatalf("a refused export wrote files: %v", entries)
+	}
+}
+
+func countFiles(t *testing.T, dir string) int {
+	t.Helper()
+	n := 0
+	err := filepath.WalkDir(dir, func(_ string, d os.DirEntry, err error) error {
+		if err == nil && !d.IsDir() {
+			n++
+		}
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// C2 end to end: output directories that are aliases of a directory inside the
+// source root (firmlink, long-s case folding) must be refused and write nothing.
+func TestExportRefusesAliasedOutputIntoSource(t *testing.T) {
+	p, _ := profile.Load(fixture.XL().FS(), fixture.XL().Folder())
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := filepath.Join(base, "src")
+	if err := os.MkdirAll(filepath.Join(src, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, out := range map[string]string{
+		"firmlink":    "/System/Volumes/Data" + src + "/sub/o1",
+		"long s fold": filepath.Join(base, "\xc5\xbfrc", "sub", "o2"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := os.Stat(filepath.Dir(out)); err != nil {
+				t.Skipf("this file system does not alias %s: %v", filepath.Dir(out), err)
+			}
+			if err := ExportFixture(p, newR(t), src, out, "F.sdProfile"); !errors.Is(err, pathguard.ErrInside) {
+				t.Fatalf("export through an alias of the source tree: %v", err)
+			}
+			if n := countFiles(t, src); n != 0 {
+				t.Fatalf("%d files written inside the protected source root", n)
+			}
+		})
+	}
+}
+
+// C1 end to end: "<missing>/../<symlink into the source>" is refused.
+func TestExportRefusesDotDotAfterMissingComponent(t *testing.T) {
+	p, _ := profile.Load(fixture.XL().FS(), fixture.XL().Folder())
+	base := t.TempDir()
+	src := filepath.Join(base, "src")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(src, filepath.Join(base, "innocent")); err != nil {
+		t.Fatal(err)
+	}
+	err := ExportFixture(p, newR(t), src, base+"/nonexist/../innocent/out", "F.sdProfile")
+	if !errors.Is(err, pathguard.ErrUnresolvable) {
+		t.Fatalf("export via a missing component then '..': %v", err)
+	}
+	if n := countFiles(t, src); n != 0 {
+		t.Fatalf("%d files written inside the protected source root", n)
+	}
+}
+
+// I3: the writer must write to the path the guard checked. "<link>/../out2" is,
+// for the kernel, a sibling of the link's TARGET; lexically cleaning it would
+// put the files beside the link instead.
+func TestExportWritesToTheCheckedPathNotTheCleanedOne(t *testing.T) {
+	p, _ := profile.Load(fixture.XL().FS(), fixture.XL().Folder())
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dest := filepath.Join(base, "deep", "dest")
+	if err := os.MkdirAll(dest, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(base, "link")
+	if err := os.Symlink(dest, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := ExportFixture(p, newR(t), filepath.Join(base, "src"), link+"/../out2", "F.sdProfile"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(base, "deep", "out2", "F.sdProfile", "manifest.json")); err != nil {
+		t.Fatalf("files did not land in the checked location: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(base, "out2")); err == nil {
+		t.Fatal("files landed in the lexically cleaned location")
+	}
+}
+
+func redactJSON(t *testing.T, r *Redactor, in string) string {
+	t.Helper()
+	v, err := jsondoc.Parse([]byte(in))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(r.Value(v).Encode())
+}
+
+// I4 and m5: every scalar under a secret-named member goes, at any depth, and
+// the wider list of secret names, URL parameters, name/value pairs and JSON
+// embedded in a string are all covered.
+func TestSecretsAreRedactedEverywhere(t *testing.T) {
+	r := newR(t)
+	cases := [][2]string{
+		{`{"token":{"value":"tok123"}}`, "tok123"},
+		{`{"auth":["tok456",{"deep":["tok457"]}]}`, "tok45"},
+		{`{"secret":{"n":12345,"b":true}}`, "12345"},
+		{`{"url":"https://h.example/api?access_token=tok789&x=1"}`, "tok789"},
+		{`{"url":"https://h.example/api?x=1&password=hunter2"}`, "hunter2"},
+		{`{"privateKey":"pk1"}`, "pk1"},
+		{`{"private_key":"pk2"}`, "pk2"},
+		{`{"AccessKey":"ak1"}`, "ak1"},
+		{`{"credentials":{"u":"cr1"}}`, "cr1"},
+		{`{"userCredential":"cr2"}`, "cr2"},
+		{`{"pass":"pw1"}`, "pw1"},
+		{`{"pin":"4321"}`, "4321"},
+		{`{"userPIN":"4322"}`, "4322"},
+		{`{"bearer":"br1"}`, "br1"},
+		{`{"Authorization":"Bearer br2"}`, "br2"},
+		{`[{"name":"token","value":"nv1"}]`, "nv1"},
+		{`[{"key":"apiKey","value":{"v":"nv2"}}]`, "nv2"},
+		{`{"payload":"{\"token\":\"emb1\"}"}`, "emb1"},
+		{`{"payload":"[{\"name\":\"secret\",\"value\":\"emb2\"}]"}`, "emb2"},
+	}
+	for _, c := range cases {
+		if out := redactJSON(t, r, c[0]); strings.Contains(out, c[1]) {
+			t.Errorf("secret %q survives in %s", c[1], out)
+		}
+	}
+	// Known-good: names that merely contain the letters keep their values.
+	for _, keep := range []string{`{"mapping":"keepme"}`, `{"Bypass":"keepme"}`, `{"spinner":"keepme"}`} {
+		if out := redactJSON(t, r, keep); !strings.Contains(out, "keepme") {
+			t.Errorf("over-redacted %s -> %s", keep, out)
+		}
+	}
+	// Embedded JSON that is not an object or array stays a plain string.
+	if out := redactJSON(t, r, `{"note":"{not json"}`); !strings.Contains(out, "{not json") {
+		t.Errorf("non-JSON string altered: %s", out)
+	}
+}
+
+// m6: URL-escaped spellings of a name leak as surely as the plain one.
+func TestEscapedNamesAreRedacted(t *testing.T) {
+	r, err := New(Options{UserNames: []string{"Alice"}, HostNames: []string{"Alice's MacBook Pro"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, in := range []string{
+		"vnc://Alice%27s%20MacBook%20Pro.local",
+		"vnc://alice%27s%20macbook%20pro.local",
+		"smb://host/?q=Alice%27s+MacBook+Pro",
+		"file://" + realHome + "/x",
+		"x%2FUsers%2Fbob%2Ffile",
+	} {
+		got := r.String(in)
+		for _, leak := range []string{"MacBook", "macbook", "Alice", "alice", "bob"} {
+			if strings.Contains(got, leak) {
+				t.Errorf("String(%q) = %q still contains %q", in, got, leak)
+			}
+		}
+	}
+}
+
+// ExportFixture pseudonymizes profile, page and action UUIDs consistently in
+// manifests and in folder names, upper-case folders staying upper-case and
+// lower-case references lower-case. Relabeling must be hash-neutral, so the
+// export hashes the same as the source after the same non-UUID redaction.
+func TestExportPseudonymizesUUIDsConsistently(t *testing.T) {
+	src := fixture.CopyOf(personal(), "real")
+	p, err := profile.Load(src.FS(), src.Folder())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Source hash after the same redaction but with the UUIDs left alone.
+	wantFS := fstest.MapFS{}
+	ref := newR(t)
+	for rel, data := range p.Files() {
+		if strings.HasSuffix(rel, "manifest.json") {
+			doc, err := jsondoc.Parse(data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			data = ref.Value(doc).Encode()
+		} else {
+			data = SyntheticPNG(data)
+		}
+		wantFS["REF.sdProfile/"+rel] = &fstest.MapFile{Data: data}
+	}
+	refProfile, err := profile.Load(wantFS, "REF.sdProfile")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantHash, err := normhash.Hash(refProfile)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out := t.TempDir()
+	folder := strings.ToUpper(src.ID) + ".sdProfile"
+	if err := ExportFixture(p, newR(t), "", out, folder); err != nil {
+		t.Fatal(err)
+	}
+	var realIDs []string
+	realIDs = append(realIDs, src.ID, src.Current, src.Default.ID)
+	for _, pg := range src.Pages {
+		realIDs = append(realIDs, pg.ID)
+		for _, b := range pg.Buttons {
+			realIDs = append(realIDs, b.ActionID)
+		}
+	}
+	err = filepath.WalkDir(out, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, _ := filepath.Rel(out, path)
+		blob := strings.ToLower(rel)
+		if !d.IsDir() {
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			blob += "\n" + strings.ToLower(string(data))
+		}
+		for _, id := range realIDs {
+			if strings.Contains(blob, strings.ToLower(id)) {
+				t.Errorf("%s still carries real id %s", rel, id)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, _ := os.ReadDir(out)
+	if len(entries) != 1 || entries[0].Name() != strings.ToUpper(entries[0].Name()[:len(entries[0].Name())-len(".sdProfile")])+".sdProfile" {
+		t.Fatalf("exported profile folder is not upper-case UUID.sdProfile: %v", entries)
+	}
+	exported, err := profile.Load(os.DirFS(out), entries[0].Name())
+	if err != nil {
+		t.Fatalf("pseudonymized export does not load: %v", err)
+	}
+	got, err := normhash.Hash(exported)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != wantHash {
+		t.Fatalf("pseudonymizing UUIDs changed the hash: %s != %s", got, wantHash)
+	}
+	// Two runs give the same names.
+	out2 := t.TempDir()
+	if err := ExportFixture(p, newR(t), "", out2, folder); err != nil {
+		t.Fatal(err)
+	}
+	var names1, names2 []string
+	for _, o := range []struct {
+		dir string
+		dst *[]string
+	}{{out, &names1}, {out2, &names2}} {
+		filepath.WalkDir(o.dir, func(path string, d fs.DirEntry, err error) error {
+			rel, _ := filepath.Rel(o.dir, path)
+			*o.dst = append(*o.dst, rel)
+			return err
+		})
+	}
+	if strings.Join(names1, "|") != strings.Join(names2, "|") {
+		t.Fatalf("export names are not deterministic:\n%v\n%v", names1, names2)
 	}
 }
