@@ -82,9 +82,11 @@ var (
 	anyDeviceKey = regexp.MustCompile(`@\((\d+)\)\[([^\]"\n]*)\]`)
 	// A body the serial rule has already redacted: vendor/product/<deckN>.
 	redactedDeviceBody = regexp.MustCompile(`^\d+/\d+/<deck\d*>$`)
-	// Tokens inside an odd key body: a placeholder (kept) or a run of three or
-	// more letters and digits (masked).
-	keyBodyToken = regexp.MustCompile(`<[a-z]+\d*>|[A-Za-z0-9]{3,}`)
+	// Tokens inside an odd key body: a placeholder (kept) or any run of letters
+	// and digits, however short (masked), so only the punctuation remains.
+	keyBodyToken = regexp.MustCompile(`<[a-z]+\d*>|[A-Za-z0-9]+`)
+	// The synthetic UUIDs uuidFor hands out, so KeyName does not renumber them.
+	syntheticUUID = regexp.MustCompile(`(?i)^aaaaaaaa-0000-4000-8000-[0-9a-f]{12}$`)
 	// Tokens in a member name (KeyName): a placeholder (kept) or a run of six
 	// or more letters and digits (masked when it mixes both).
 	keyNameToken   = regexp.MustCompile(`<[a-z]+\d*>|[A-Za-z0-9]{6,}`)
@@ -184,7 +186,7 @@ func (r *Redactor) numbered(m map[string]string, name, value string) string {
 
 // maskOddDeviceKeys masks the body of every device key that is not in
 // vendor/product/serial form (those are handled by the serial rule): each run
-// of three or more letters and digits becomes <key>, <key2>, …, while the
+// of letters and digits, of any length, becomes <key>, <key2>, …, while the
 // "@(n)[", "]" and punctuation are kept so the key's shape stays visible.
 func (r *Redactor) maskOddDeviceKeys(s string) string {
 	return anyDeviceKey.ReplaceAllStringFunc(s, func(k string) string {
@@ -204,12 +206,20 @@ func (r *Redactor) maskOddDeviceKeys(s string) string {
 }
 
 // KeyName redacts a member name whose shape is unknown, such as a prefs
-// Devices entry that is not a device record (U7): String's rules apply, and
-// then every token of six or more characters that mixes letters and digits
-// becomes <id>, <id2>, … (an identifier or serial, by its look). Words of
-// letters only, such as "ESDProfilesPreferred", and plain numbers stay readable.
+// Devices entry that is not a device record (U7): String's rules apply, a
+// whole UUID becomes the redactor's synthetic one (uuidFor, so no part of its
+// hex survives), and then every token of six or more characters that mixes
+// letters and digits becomes <id>, <id2>, … (an identifier or serial, by its
+// look). Words of letters only, such as "ESDProfilesPreferred", and plain
+// numbers stay readable.
 func (r *Redactor) KeyName(s string) string {
 	s = r.String(s)
+	s = uuidRe.ReplaceAllStringFunc(s, func(m string) string {
+		if syntheticUUID.MatchString(m) {
+			return m
+		}
+		return r.pseudonymizeUUIDs(m, false)
+	})
 	return keyNameToken.ReplaceAllStringFunc(s, func(tok string) string {
 		if anyPlaceholder.MatchString(tok) || !hasLetter.MatchString(tok) || !hasDigit.MatchString(tok) {
 			return tok
