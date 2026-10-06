@@ -9,4 +9,6 @@ require (
 	howett.net/plist v1.0.1
 )
 
+require golang.org/x/text v0.42.0 // indirect
+
 replace github.com/csmarshall/schrodeck/deckformat => ./deckformat

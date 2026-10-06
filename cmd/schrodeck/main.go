@@ -13,6 +13,7 @@ import (
 	"syscall"
 
 	"github.com/csmarshall/schrodeck/internal/cli"
+	"github.com/csmarshall/schrodeck/internal/connector"
 	"github.com/csmarshall/schrodeck/internal/logging"
 	"github.com/csmarshall/schrodeck/internal/version"
 )
@@ -23,12 +24,19 @@ func main() {
 		fmt.Fprintln(os.Stderr, "schrodeck:", err)
 		os.Exit(cli.ExitUsage)
 	}
+	// Branch on the Host, not the error: on an OS without a connector the
+	// error is always set, and commands that need a Host say so themselves.
+	h, err := connector.New()
+	if h == nil {
+		logger.Debug("no OS connector", "component", "main", "error", err)
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	code := cli.Run(ctx, os.Args[1:], cli.Env{
 		Stdout:  os.Stdout,
 		Stderr:  os.Stderr,
 		Version: version.Version,
 		Logger:  logger,
+		Host:    h,
 	})
 	stop()
 	os.Exit(code)

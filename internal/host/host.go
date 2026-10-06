@@ -20,6 +20,15 @@ type AppPresence interface {
 	Running() (bool, error)
 }
 
+// DeckLoader is a DeviceEnumerator that also returns one
+// *profile.FolderError per profile folder that failed to load. Such a profile
+// cannot be matched to a deck, so commands that report on the host show these
+// errors rather than let the deck look unbound. A connector may implement it;
+// commands fall back to Decks when it does not.
+type DeckLoader interface {
+	DecksWithLoadErrors() ([]ports.Deck, []error, error)
+}
+
 // Host is this computer as seen through its connector.
 type Host struct {
 	Paths    ports.Paths

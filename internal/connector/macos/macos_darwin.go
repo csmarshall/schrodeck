@@ -44,6 +44,7 @@ var (
 	_ ports.AppPrefs         = (*Connector)(nil)
 	_ ports.DeviceEnumerator = (*Connector)(nil)
 	_ host.AppPresence       = (*Connector)(nil)
+	_ host.DeckLoader        = (*Connector)(nil)
 )
 
 // New returns the connector for the current user.
