@@ -775,7 +775,7 @@ func TestStateDirInsideAppDataIsRefused(t *testing.T) {
 		t.Fatalf("doctor --accept-fingerprint: exit %d\n%s", code, out.String())
 	}
 	env, _, errb := testEnv(nil, h)
-	if code := Run(context.Background(), []string{"observe", "start", "u0-state"}, env); code != ExitFail || !strings.Contains(errb.String(), "state dir is refused") {
+	if code := Run(context.Background(), []string{"observe", "start", "u0-state"}, env); code != ExitFail || !strings.Contains(errb.String(), "state path is refused") {
 		t.Fatalf("observe start: exit %d %q", code, errb.String())
 	}
 	if _, err := os.Stat(h.Paths.StateDir()); !os.IsNotExist(err) {
@@ -840,5 +840,71 @@ func TestCorruptKnownSetFailsFPAndCanBeReplaced(t *testing.T) {
 	env, _, _ = testEnv(nil, h)
 	if code := Run(context.Background(), []string{"doctor"}, env); code != ExitOK {
 		t.Fatal("doctor still fails after the corrupt set was replaced")
+	}
+}
+
+func TestObserveDirSymlinkedIntoAppDataIsRefused(t *testing.T) {
+	// The reviewer's probe: StateDir itself is fine, but StateDir/observe is a
+	// symlink into ProfilesV3, so the observation dir would land in the app's data.
+	h := fakeHost(t)
+	if err := os.MkdirAll(h.Paths.StateDir(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(h.Paths.ProfilesDir(), filepath.Join(h.Paths.StateDir(), "observe")); err != nil {
+		t.Fatal(err)
+	}
+	env, _, errb := testEnv(nil, h)
+	if code := Run(context.Background(), []string{"observe", "start", "u0-sym"}, env); code == ExitOK || !strings.Contains(errb.String(), "state path is refused") {
+		t.Fatalf("start through a symlinked observe dir: exit %d %q", code, errb.String())
+	}
+	assertAppDataUntouched(t, h)
+	// A stop must refuse too, never RemoveAll inside the app's data. Plant a
+	// folder where the observation would be, as an earlier unguarded start did.
+	planted := filepath.Join(h.Paths.ProfilesDir(), "u0-sym")
+	if err := os.Mkdir(planted, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	env, _, errb = testEnv(nil, h)
+	if code := Run(context.Background(), []string{"observe", "stop", "u0-sym"}, env); code == ExitOK || !strings.Contains(errb.String(), "state path is refused") {
+		t.Fatalf("stop through a symlinked observe dir: exit %d %q", code, errb.String())
+	}
+	if _, err := os.Stat(planted); err != nil {
+		t.Fatal("stop removed a folder inside the app's data")
+	}
+}
+
+func TestUnreadableKnownSetIsNeverReplaced(t *testing.T) {
+	h := fakeHost(t)
+	env, _, _ := testEnv(nil, h)
+	if code := Run(context.Background(), []string{"doctor", "--accept-fingerprint"}, env); code != ExitOK {
+		t.Fatal("first accept failed")
+	}
+	known := filepath.Join(h.Paths.StateDir(), doctor.KnownFile)
+	valid, err := os.ReadFile(known)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A new format fingerprint, so an accept would want to write.
+	manifest := filepath.Join(h.Paths.ProfilesDir(), fixture.XL().Folder(), "manifest.json")
+	b, _ := os.ReadFile(manifest)
+	if err := os.WriteFile(manifest, bytes.Replace(b, []byte(`"Name":`), []byte(`"NewField":1,"Name":`), 1), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(known, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(known, 0o600) })
+	if _, err := os.ReadFile(known); err == nil {
+		t.Skip("cannot make a file unreadable here (running as root?)")
+	}
+	env, out, errb := testEnv(nil, h)
+	if code := Run(context.Background(), []string{"doctor", "--accept-fingerprint", "--json"}, env); code != ExitFail || !strings.Contains(out.String(), "permission denied") {
+		t.Fatalf("accept over an unreadable known set: exit %d\n%s%s", code, out.String(), errb.String())
+	}
+	if err := os.Chmod(known, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if after, _ := os.ReadFile(known); !bytes.Equal(after, valid) {
+		t.Fatal("an unreadable but valid known set was replaced")
 	}
 }

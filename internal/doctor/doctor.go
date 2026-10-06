@@ -50,6 +50,11 @@ func (k Known) Contains(digest string) bool {
 	return false
 }
 
+// ErrCorrupt marks a known-good set that was read but is not valid JSON. Only
+// such a file may be replaced by an accept; an I/O or permission error is never
+// a reason to overwrite a file that may be fine.
+var ErrCorrupt = errors.New("not a valid known-good set")
+
 // LoadKnown reads the known-good set; a missing file is an empty set.
 func LoadKnown(stateDir string) (Known, error) {
 	b, err := os.ReadFile(filepath.Join(stateDir, KnownFile))
@@ -61,7 +66,7 @@ func LoadKnown(stateDir string) (Known, error) {
 	}
 	var k Known
 	if err := json.Unmarshal(b, &k); err != nil {
-		return Known{}, fmt.Errorf("%s: %w", KnownFile, err)
+		return Known{}, fmt.Errorf("%s: %w: %w", KnownFile, ErrCorrupt, err)
 	}
 	return k, nil
 }

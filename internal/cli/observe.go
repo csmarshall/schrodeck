@@ -123,10 +123,19 @@ func mergeSnapshotLoadErrors(have []observe.LoadError, more []error) []observe.L
 
 // guardStateDir refuses a state dir that resolves inside the app's data
 // (a misconfigured connector or a symlink): schrodeck's own writes and
-// deletions there would land in the app's files.
+// deletions there would land in the app's files. Each path below it that is
+// then written or removed is checked too (guardStatePath), since a symlink
+// below the state dir can point anywhere.
 func guardStateDir(env Env) error {
-	if err := pathguard.RefuseInside(env.Host.Paths.StateDir(), protectedRoots(env)...); err != nil {
-		return fmt.Errorf("schrodeck's state dir is refused: %w", err)
+	return guardStatePath(env, env.Host.Paths.StateDir())
+}
+
+// guardStatePath refuses a path under schrodeck's state dir whose resolved
+// final target lies inside the app's data. Call it on the exact path about to
+// be created, written or removed.
+func guardStatePath(env Env, target string) error {
+	if err := pathguard.RefuseInside(target, protectedRoots(env)...); err != nil {
+		return fmt.Errorf("schrodeck's state path is refused: %w", err)
 	}
 	return nil
 }
@@ -191,10 +200,16 @@ func runObserve(ctx context.Context, env Env, args []string) (res result, err er
 			return result{}, usageError{fmt.Sprintf("--out %s already exists; reports are never overwritten", *out)}
 		}
 	}
+	dir := observeDir(env, name)
+	// The state dir and the observation's own dir, resolved: start creates
+	// it, stop reads and removes it, and either through a symlink below the
+	// state dir could reach the app's files.
 	if err := guardStateDir(env); err != nil {
 		return result{}, err
 	}
-	dir := observeDir(env, name)
+	if err := guardStatePath(env, dir); err != nil {
+		return result{}, err
+	}
 
 	if verb == "start" {
 		if _, err := os.Stat(dir); err == nil {

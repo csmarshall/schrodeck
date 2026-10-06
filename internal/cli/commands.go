@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -425,8 +426,13 @@ func runDoctor(ctx context.Context, env Env, args []string) (result, error) {
 		d.Fingerprint = digest
 		// An unreadable known-good set fails FP (fail closed) without hiding
 		// the other checks; an accept replaces it.
+		// Only a file that is not valid JSON may be replaced; any other read
+		// error (permissions, I/O) is a hard error, so a valid file is never wiped.
 		known, knownErr := doctor.LoadKnown(h.Paths.StateDir())
 		if knownErr != nil {
+			if !errors.Is(knownErr, doctor.ErrCorrupt) {
+				return result{}, knownErr
+			}
 			known = doctor.Known{}
 		}
 		if *accept && !known.Contains(digest) {
@@ -437,6 +443,9 @@ func runDoctor(ctx context.Context, env Env, args []string) (result, error) {
 				d.AcceptRefused = "another check failed; a fingerprint is accepted only when every other check passes"
 			default:
 				if err := guardStateDir(env); err != nil {
+					return result{}, err
+				}
+				if err := guardStatePath(env, filepath.Join(h.Paths.StateDir(), doctor.KnownFile)); err != nil {
 					return result{}, err
 				}
 				version, _ := h.Prefs.AppVersion()
