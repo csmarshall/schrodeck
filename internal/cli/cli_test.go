@@ -908,3 +908,189 @@ func TestUnreadableKnownSetIsNeverReplaced(t *testing.T) {
 		t.Fatal("an unreadable but valid known set was replaced")
 	}
 }
+
+func TestInventoryListsRawPrefsEntries(t *testing.T) {
+	h := fakeHost(t)
+	prefs := h.Prefs.(fake.Prefs)
+	prefs.Records = append(append([]map[string]any{}, prefs.Records...), map[string]any{decks.RecordKey: "SomethingElse", decks.RecordRaw: "opaque-value-" + "ZZ"})
+	h.Prefs = prefs
+	env, out, _ := testEnv(nil, h)
+	if code := Run(context.Background(), []string{"inventory", "--json"}, env); code != ExitOK {
+		t.Fatalf("exit %d", code)
+	}
+	if !strings.Contains(out.String(), `"raw_prefs":[{"key":"SomethingElse","type":"string"}]`) {
+		t.Fatalf("the raw prefs entry is not listed with its type:\n%s", out.String())
+	}
+	env, text, _ := testEnv(nil, h)
+	Run(context.Background(), []string{"inventory"}, env)
+	if !strings.Contains(text.String(), "RAW prefs entry (not a device record): SomethingElse, value type string") {
+		t.Fatalf("text lacks the raw prefs entry:\n%s", text.String())
+	}
+	if strings.Contains(out.String()+text.String(), "opaque-value") {
+		t.Fatal("inventory printed a raw prefs value")
+	}
+}
+
+func TestUnrecognisedKeyWithBoundProfileIsListed(t *testing.T) {
+	// Known-bad: a key of a type ParseKey rejects, with a profile bound to it,
+	// used to vanish: dropped from the deck list, and not unmatched because a
+	// profile is bound.
+	h := fakeHost(t)
+	serial := "HH77" + "II88"
+	odd := "@(2)[4057/143/" + serial + "]"
+	manifest := filepath.Join(h.Paths.ProfilesDir(), fixture.XL().Folder(), "manifest.json")
+	b, _ := os.ReadFile(manifest)
+	if err := os.WriteFile(manifest, bytes.Replace(b, []byte(fixture.Device), []byte(odd), 1), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	prefs := h.Prefs.(fake.Prefs)
+	prefs.Records = []map[string]any{{decks.RecordKey: odd}}
+	prefs.Selected = nil
+	h.Prefs = prefs
+	env, out, _ := testEnv(nil, h)
+	Run(context.Background(), []string{"inventory", "--json"}, env)
+	if !strings.Contains(out.String(), `"unrecognised":[{"key":"@(2)[4057/143/<deck`) || !strings.Contains(out.String(), `"profiles":1}]`) {
+		t.Fatalf("the unrecognised key is not listed with its bound profile:\n%s", out.String())
+	}
+	env, text, _ := testEnv(nil, h)
+	Run(context.Background(), []string{"inventory"}, env)
+	if !strings.Contains(text.String(), "UNRECOGNISED device key (1 profile(s) bound): @(2)[4057/143/<deck") {
+		t.Fatalf("text lacks the unrecognised key:\n%s", text.String())
+	}
+	env, doc, _ := testEnv(nil, h)
+	Run(context.Background(), []string{"doctor", "--json"}, env)
+	if !strings.Contains(doc.String(), `@(2)[4057/143/<deck`) || !strings.Contains(doc.String(), "device key type not recognised; 1 profile(s) bound") {
+		t.Fatalf("doctor M2 does not name the unrecognised key:\n%s", doc.String())
+	}
+	if strings.Contains(out.String()+text.String()+doc.String(), serial) {
+		t.Fatal("a serial was printed")
+	}
+}
+
+func TestDeckWhyTexts(t *testing.T) {
+	why := func(records []map[string]any) []string {
+		h := fakeHost(t)
+		prefs := h.Prefs.(fake.Prefs)
+		prefs.Records = records
+		h.Prefs = prefs
+		env, out, _ := testEnv(nil, h)
+		Run(context.Background(), []string{"inventory", "--json"}, env)
+		var doc struct {
+			Data struct {
+				Decks []struct {
+					Why string `json:"why"`
+				} `json:"decks"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(out.Bytes(), &doc); err != nil {
+			t.Fatal(err)
+		}
+		var ws []string
+		for _, d := range doc.Data.Decks {
+			ws = append(ws, d.Why)
+		}
+		return ws
+	}
+	if got := why([]map[string]any{{decks.RecordKey: decks.VirtualKey}}); len(got) != 1 || got[0] != "virtual decks are not sync destinations until U5/U8 are observed" {
+		t.Fatalf("single virtual deck: %q", got)
+	}
+	if got := why([]map[string]any{{decks.RecordKey: fixture.Device}, {decks.RecordKey: fixture.Device}}); len(got) != 2 || got[0] != "another deck on this computer has the same key" {
+		t.Fatalf("two physical decks sharing a key: %q", got)
+	}
+}
+
+func TestPlainDoctorWithUnreadableKnownSetFailsFP(t *testing.T) {
+	h := fakeHost(t)
+	env, _, _ := testEnv(nil, h)
+	if code := Run(context.Background(), []string{"doctor", "--accept-fingerprint"}, env); code != ExitOK {
+		t.Fatal("accept failed")
+	}
+	known := filepath.Join(h.Paths.StateDir(), doctor.KnownFile)
+	if err := os.Chmod(known, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(known, 0o600) })
+	if _, err := os.ReadFile(known); err == nil {
+		t.Skip("cannot make a file unreadable here (running as root?)")
+	}
+	env, out, _ := testEnv(nil, h)
+	if code := Run(context.Background(), []string{"doctor", "--json"}, env); code != ExitFail {
+		t.Fatalf("exit %d", code)
+	}
+	if !strings.Contains(out.String(), `"id":"P1"`) || !strings.Contains(out.String(), `"id":"FP","contract":"C","tier":"read-only","status":"fail","detail":"the known-good fingerprint set cannot be read`) || !strings.Contains(out.String(), "will not replace it") {
+		t.Fatalf("plain doctor did not report an unreadable known set as a failed FP row:\n%s", out.String())
+	}
+}
+
+func TestObserveFailsWhenPrefsUnreadable(t *testing.T) {
+	h := fakeHost(t)
+	good := h.Prefs.(fake.Prefs)
+	h.Prefs = brokenPrefs{good}
+	env, _, errb := testEnv(nil, h)
+	if code := Run(context.Background(), []string{"observe", "start", "u0-noprefs"}, env); code != ExitFail || !strings.Contains(errb.String(), "unreadable") {
+		t.Fatalf("start with unreadable prefs: exit %d %q", code, errb.String())
+	}
+	dir := filepath.Join(h.Paths.StateDir(), "observe", "u0-noprefs")
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatal("a snapshot without prefs was saved")
+	}
+	h.Prefs = good
+	env, _, _ = testEnv(nil, h)
+	if code := Run(context.Background(), []string{"observe", "start", "u0-noprefs"}, env); code != ExitOK {
+		t.Fatal("start failed")
+	}
+	h.Prefs = brokenPrefs{good}
+	env, _, errb = testEnv(nil, h)
+	if code := Run(context.Background(), []string{"observe", "stop", "u0-noprefs"}, env); code != ExitFail || !strings.Contains(errb.String(), "unreadable") {
+		t.Fatalf("stop with unreadable prefs: exit %d %q", code, errb.String())
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatal("a failed stop left the snapshots behind")
+	}
+}
+
+func TestStatusReportsReadErrors(t *testing.T) {
+	h := fakeHost(t)
+	h.Decks = fake.Decks{Err: errors.New("deck read failed")}
+	if err := os.RemoveAll(h.Paths.ProfilesDir()); err != nil {
+		t.Fatal(err)
+	}
+	env, out, _ := testEnv(nil, h)
+	if code := Run(context.Background(), []string{"status", "--json"}, env); code != ExitFail {
+		t.Fatalf("status with read errors: exit %d\n%s", code, out.String())
+	}
+	if !strings.Contains(out.String(), `"errors":["decks: deck read failed","profiles: `) || !strings.Contains(out.String(), `"ok":false`) {
+		t.Fatalf("status JSON lacks the read errors:\n%s", out.String())
+	}
+	env, text, _ := testEnv(nil, h)
+	Run(context.Background(), []string{"status"}, env)
+	if !strings.Contains(text.String(), "ERROR decks: deck read failed") {
+		t.Fatalf("status text lacks the read error:\n%s", text.String())
+	}
+}
+
+func TestShowIDsHelpNamesEverythingItUnredacts(t *testing.T) {
+	env, _, errb := testEnv(nil, fakeHost(t))
+	if code := Run(context.Background(), []string{"inventory", "-h"}, env); code != ExitOK {
+		t.Fatalf("exit %d", code)
+	}
+	if !strings.Contains(errb.String(), "user and host names in profile names, app identifiers and errors") {
+		t.Fatalf("--show-ids help: %q", errb.String())
+	}
+}
+
+func TestInventoryTextShowsProfileDevice(t *testing.T) {
+	env, out, _ := testEnv(nil, fakeHost(t))
+	Run(context.Background(), []string{"inventory"}, env)
+	if !strings.Contains(out.String(), "device="+fixture.Device) {
+		t.Fatalf("profile line lacks the device:\n%s", out.String())
+	}
+}
+
+func TestFixtureProfileMustBeSingleName(t *testing.T) {
+	h := fakeHost(t)
+	env, out, errb := testEnv(nil, h)
+	if code := Run(context.Background(), []string{"fixture", "export", "--profile", "../app/ProfilesV3/" + fixture.XL().Folder(), "--out", filepath.Join(t.TempDir(), "fx"), "--name", "X.sdProfile"}, env); code != ExitUsage || out.Len() != 0 {
+		t.Fatalf("a --profile path was not refused as a usage error: exit %d %q", code, errb.String())
+	}
+}

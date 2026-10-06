@@ -133,6 +133,11 @@ func m2(h *host.Host, load profile.LoadResult) (probe.Status, string, []string) 
 	}
 	status := probe.Pass
 	var ev []string
+	virtualMissing, unrecognised := false, false
+	for _, u := range decks.Unrecognised(recs, load.Profiles) {
+		ev = append(ev, fmt.Sprintf("%s: device key type not recognised; %d profile(s) bound to it", u.Key, u.Profiles))
+		unrecognised = true
+	}
 	for _, rec := range recs {
 		if _, raw := rec[decks.RecordRaw]; raw {
 			continue
@@ -151,20 +156,26 @@ func m2(h *host.Host, load profile.LoadResult) (probe.Status, string, []string) 
 		}
 		if virtual {
 			ev = append(ev, key+": selected profile has no folder on disk (known for virtual decks, U4)")
-			if status == probe.Pass {
-				status = probe.Info
-			}
+			virtualMissing = true
 			continue
 		}
 		ev = append(ev, key+": selected profile has no folder on disk")
 		status = probe.Fail
 	}
-	detail := map[probe.Status]string{
-		probe.Pass: "every deck's selected profile exists",
-		probe.Info: "only virtual decks point at missing profiles",
-		probe.Fail: "a physical deck's selected profile is missing",
-	}[status]
-	return status, detail, ev
+	if status == probe.Fail {
+		return status, "a physical deck's selected profile is missing", ev
+	}
+	var notes []string
+	if virtualMissing {
+		notes = append(notes, "only virtual decks point at missing profiles")
+	}
+	if unrecognised {
+		notes = append(notes, "some device keys are of a type schrodeck does not recognise")
+	}
+	if len(notes) > 0 {
+		return probe.Info, strings.Join(notes, "; "), ev
+	}
+	return probe.Pass, "every deck's selected profile exists", ev
 }
 
 // Fingerprint is ADR 0015's check: is this host's current format

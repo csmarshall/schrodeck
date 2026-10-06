@@ -256,3 +256,79 @@ func Keyed(records []map[string]any) map[string]map[string]any {
 	}
 	return out
 }
+
+// UnrecognisedKey is a device record whose key ParseKey rejects (a type other
+// than 0 or 1, or no device key at all), with the number of profiles bound to
+// it. Such a record is not in the deck list, and it would also be missing from
+// Unmatched once a profile is bound to it, so it is listed here either way.
+type UnrecognisedKey struct {
+	Key      string
+	Profiles int
+}
+
+// Unrecognised lists every device record key ParseKey rejects, sorted, with
+// how many profiles name it as their Device.UUID. Records marked RecordRaw are
+// not device records and are listed by RawEntries instead.
+func Unrecognised(records []map[string]any, profiles []*profile.Profile) []UnrecognisedKey {
+	bound := map[string]int{}
+	for _, p := range profiles {
+		bound[p.DeviceUUID()]++
+	}
+	seen := map[string]bool{}
+	var out []UnrecognisedKey
+	for _, rec := range records {
+		if _, raw := rec[RecordRaw]; raw {
+			continue
+		}
+		key, _ := rec[RecordKey].(string)
+		if _, _, _, _, ok := ParseKey(key); ok || seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, UnrecognisedKey{Key: key, Profiles: bound[key]})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+	return out
+}
+
+// RawEntry is a prefs Devices entry that is not a device record (RecordRaw):
+// its key and the JSON type of its value. The value itself is never carried,
+// since nothing is known about what it holds (U7).
+type RawEntry struct {
+	Key  string
+	Type string
+}
+
+// RawEntries lists the RecordRaw entries, sorted by key.
+func RawEntries(records []map[string]any) []RawEntry {
+	var out []RawEntry
+	for _, rec := range records {
+		v, raw := rec[RecordRaw]
+		if !raw {
+			continue
+		}
+		key, _ := rec[RecordKey].(string)
+		out = append(out, RawEntry{Key: key, Type: jsonType(v)})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+	return out
+}
+
+// jsonType names the JSON type a decoded value would have.
+func jsonType(v any) string {
+	switch v.(type) {
+	case nil:
+		return "null"
+	case string:
+		return "string"
+	case bool:
+		return "bool"
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64:
+		return "number"
+	case []any:
+		return "array"
+	case map[string]any:
+		return "object"
+	}
+	return fmt.Sprintf("%T", v)
+}

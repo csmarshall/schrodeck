@@ -102,7 +102,7 @@ type AppPrefs interface {
 | Store | `~/Library/Preferences/com.elgato.StreamDeck.plist` | registry `HKCU\Software\Elgato Systems GmbH\StreamDeck` (the at-scale article uses this key [R3](../references.md)) |
 | AppVersion | app bundle `Info.plist` `CFBundleShortVersionString` | file version of `StreamDeck.exe` |
 
-Observed on macOS (2026-10-02): the `Devices` dictionary also holds one entry whose value is a string, not a device record. The connector keeps it visible as `_raw` (for observations) and the deck list skips it.
+Observed on macOS (2026-10-02): the `Devices` dictionary also holds one entry whose value is a string, not a device record. The connector keeps it visible as `_raw` (for observations) and the deck list skips it; `inventory` lists it by key and value type only (U7). Record values are JSON-friendly: plist dates become RFC 3339 UTC strings, and plist data becomes `data:<length>:<first 12 hex of its sha256>`, never the bytes, so a report shows whether a blob changed without carrying it.
 
 ### 6. `Watcher`: change notification
 

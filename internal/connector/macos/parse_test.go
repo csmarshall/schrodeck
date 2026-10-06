@@ -55,7 +55,9 @@ func TestDeviceRecordsKeepsOddEntriesVisible(t *testing.T) {
 	if recs[0][decks.RecordKey] != "@(0)[]" || recs[2][decks.RecordRaw] != "some string" {
 		t.Fatalf("records not sorted or odd entry lost: %v", recs)
 	}
-	if recs[1]["blob"] != "base64:AQI=" {
+	// data:<length>:<first 12 hex of sha256>; the digest of 0x01 0x02 was
+	// computed with shasum, not with this code.
+	if recs[1]["blob"] != "data:2:a12871fee210" {
 		t.Fatalf("data not converted: %v", recs[1]["blob"])
 	}
 	if got, err := Preferred(prefs, "@(0)[]"); err != nil || got != "abc" {
@@ -110,7 +112,7 @@ func TestDeviceRecordsFromRealPlistSurviveFromAny(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FromAny on converted record: %v", err)
 	}
-	if got := v.Get("blob"); !strIs(got, "base64:AQI=") {
+	if got := v.Get("blob"); !strIs(got, "data:2:a12871fee210") {
 		t.Errorf("blob = %v", got)
 	}
 	if got := v.Get("when"); !strIs(got, "2026-10-02T01:02:03Z") {

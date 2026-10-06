@@ -51,15 +51,19 @@ func snapshot(ctx context.Context, env Env) (*observe.Snapshot, error) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		var prefs *jsondoc.Value
-		if recs, err := h.Prefs.DeviceRecords(); err == nil {
-			devices := map[string]any{}
-			for key, rec := range decks.Keyed(recs) {
-				devices[key] = map[string]any(rec)
-			}
-			if prefs, err = jsondoc.FromAny(map[string]any{"Devices": devices}); err != nil {
-				return nil, err
-			}
+		// A prefs read that fails is an error, not a snapshot without prefs:
+		// that would report every device record as removed or added.
+		recs, err := h.Prefs.DeviceRecords()
+		if err != nil {
+			return nil, fmt.Errorf("reading the app's device records: %w", err)
+		}
+		devices := map[string]any{}
+		for key, rec := range decks.Keyed(recs) {
+			devices[key] = map[string]any(rec)
+		}
+		prefs, err := jsondoc.FromAny(map[string]any{"Devices": devices})
+		if err != nil {
+			return nil, err
 		}
 		version, _ := h.Prefs.AppVersion()
 		s, err := observe.Take(os.DirFS(h.Paths.ProfilesDir()), prefs, version, now(h))
@@ -316,6 +320,9 @@ func runFixture(_ context.Context, env Env, args []string) (result, error) {
 	}
 	if env.Host == nil {
 		return result{}, errNoHost
+	}
+	if pathguard.SingleName(*src) != nil {
+		return result{}, usageError{"--profile must be a single folder name inside the profiles directory"}
 	}
 	folder := *name
 	if folder == "" {

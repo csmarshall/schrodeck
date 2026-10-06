@@ -5,6 +5,7 @@
 package identity
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/csmarshall/schrodeck/internal/ports/fake"
@@ -65,5 +66,13 @@ func TestHostID(t *testing.T) {
 	}
 	if _, err := HostID(fake.HostIdentity{User: "alice"}); err == nil {
 		t.Fatal("missing hardware id accepted")
+	}
+	// Contract D: host_id is lower-case text.
+	if got != strings.ToLower(got) {
+		t.Fatalf("host_id %q is not lower case", got)
+	}
+	// Known-bad: an empty user name would make every user on the Mac one host.
+	if _, err := HostID(fake.HostIdentity{Hardware: "HW-TEST-0001"}); err == nil {
+		t.Fatal("empty user name accepted")
 	}
 }

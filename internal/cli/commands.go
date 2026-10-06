@@ -173,6 +173,9 @@ type hostStatus struct {
 type statusData struct {
 	SchrodeckVersion string      `json:"schrodeck_version"`
 	Host             *hostStatus `json:"host,omitempty"`
+	// Errors are reads that failed (decks, profiles); the counts beside them
+	// are then incomplete, so status reports failure.
+	Errors []string `json:"errors,omitempty"`
 }
 
 func runStatus(_ context.Context, env Env, args []string) (result, error) {
@@ -183,16 +186,26 @@ func runStatus(_ context.Context, env Env, args []string) (result, error) {
 	var text strings.Builder
 	fmt.Fprintf(&text, "schrodeck %s\n", env.Version)
 	if h := env.Host; h != nil {
-		hs, err := hostSummary(h)
+		hs, readErrs, err := hostSummary(h)
 		if err != nil {
 			return result{}, err
 		}
 		d.Host = &hs
 		fmt.Fprintf(&text, "host %s · Stream Deck app %s (installed %v, running %v) · %d deck(s) · %d profile(s)\n",
 			hs.HostID, orUnknown(hs.App.Version), hs.App.Installed, hs.App.Running, hs.Decks, hs.Profiles)
+		if len(readErrs) > 0 {
+			r, err := redactor(env)
+			if err != nil {
+				return result{}, err
+			}
+			for _, e := range readErrs {
+				d.Errors = append(d.Errors, r.String(e))
+				fmt.Fprintf(&text, "ERROR %s\n", r.String(e))
+			}
+		}
 	}
 	text.WriteString("No setups yet: syncing arrives in a later milestone.\n")
-	return result{data: d, text: text.String()}, nil
+	return result{data: d, text: text.String(), failed: len(d.Errors) > 0}, nil
 }
 
 func orUnknown(s string) string {
@@ -202,28 +215,36 @@ func orUnknown(s string) string {
 	return s
 }
 
-func hostSummary(h *host.Host) (hostStatus, error) {
+// hostSummary is status's view of the host. A failed deck or profile read
+// does not stop it, but is returned (unredacted) so status can report it; the
+// app version is optional (an app that is not installed has none).
+func hostSummary(h *host.Host) (hostStatus, []string, error) {
 	id, err := identity.HostID(h.Identity)
 	if err != nil {
-		return hostStatus{}, err
+		return hostStatus{}, nil, err
 	}
 	hs := hostStatus{HostID: id}
 	if hs.App.Installed, err = h.App.Installed(); err != nil {
-		return hostStatus{}, err
+		return hostStatus{}, nil, err
 	}
 	if hs.App.Running, err = h.App.Running(); err != nil {
-		return hostStatus{}, err
+		return hostStatus{}, nil, err
 	}
 	if v, err := h.Prefs.AppVersion(); err == nil {
 		hs.App.Version = v
 	}
+	var readErrs []string
 	if ds, _, err := listDecks(h); err == nil {
 		hs.Decks = len(ds)
+	} else {
+		readErrs = append(readErrs, "decks: "+err.Error())
 	}
 	if res, err := loadProfiles(h); err == nil {
 		hs.Profiles = len(res.Profiles)
+	} else {
+		readErrs = append(readErrs, "profiles: "+err.Error())
 	}
-	return hs, nil
+	return hs, readErrs, nil
 }
 
 type deckInfo struct {
@@ -256,6 +277,22 @@ type inventoryData struct {
 	Profiles    []profileInfo `json:"profiles"`
 	LoadErrors  []string      `json:"load_errors,omitempty"`
 	Unmatched   *unmatched    `json:"unmatched,omitempty"`
+	// Unrecognised lists every prefs device key of a type schrodeck does not
+	// know, whether or not a profile is bound to it.
+	Unrecognised []unrecognisedInfo `json:"unrecognised,omitempty"`
+	// RawPrefs lists the prefs Devices entries that are not device records
+	// (U7): key and value type only, never the value.
+	RawPrefs []rawPrefInfo `json:"raw_prefs,omitempty"`
+}
+
+type unrecognisedInfo struct {
+	Key      string `json:"key"`
+	Profiles int    `json:"profiles"`
+}
+
+type rawPrefInfo struct {
+	Key  string `json:"key"`
+	Type string `json:"type"`
 }
 
 // unmatched is what the deck list cannot tie together (the U9 observation):
@@ -267,7 +304,7 @@ type unmatched struct {
 
 func runInventory(_ context.Context, env Env, args []string) (result, error) {
 	fs := newFlags("inventory")
-	showIDs := fs.Bool("show-ids", false, "print device ids unredacted (they contain deck serials)")
+	showIDs := fs.Bool("show-ids", false, "print device ids unredacted (they contain deck serials), and also user and host names in profile names, app identifiers and errors")
 	if err := noArgs("inventory", fs, env, args); err != nil {
 		return result{}, err
 	}
@@ -299,6 +336,8 @@ func runInventory(_ context.Context, env Env, args []string) (result, error) {
 	for _, s := range decks.Annotate(ds) {
 		di := deckInfo{Key: show(s.AppDeviceID), Model: s.Model, Columns: s.Geometry.Columns, Rows: s.Geometry.Rows, Dials: s.Geometry.Dials, Virtual: s.Virtual, Destination: s.Destination()}
 		switch {
+		case s.Virtual:
+			di.Why = "virtual decks are not sync destinations until U5/U8 are observed"
 		case !s.KeyUnique:
 			di.Why = "another deck on this computer has the same key"
 		case !s.GeometryKnown:
@@ -340,6 +379,12 @@ func runInventory(_ context.Context, env Env, args []string) (result, error) {
 		if len(profs) > 0 || len(keys) > 0 {
 			d.Unmatched = &unmatched{Profiles: profs, Decks: keys}
 		}
+		for _, u := range decks.Unrecognised(recs, res.Profiles) {
+			d.Unrecognised = append(d.Unrecognised, unrecognisedInfo{Key: show(u.Key), Profiles: u.Profiles})
+		}
+		for _, e := range decks.RawEntries(recs) {
+			d.RawPrefs = append(d.RawPrefs, rawPrefInfo{Key: show(e.Key), Type: e.Type})
+		}
 	}
 
 	var text strings.Builder
@@ -353,7 +398,7 @@ func runInventory(_ context.Context, env Env, args []string) (result, error) {
 	}
 	text.WriteString("\nprofiles:\n")
 	for _, pi := range d.Profiles {
-		fmt.Fprintf(&text, "  %-48s %-24q pages=%d hash=%s %s\n", pi.Folder, pi.Name, pi.Pages, short(pi.Hash), pi.HashError)
+		fmt.Fprintf(&text, "  %-48s %-24q device=%s pages=%d hash=%s %s\n", pi.Folder, pi.Name, pi.Device, pi.Pages, short(pi.Hash), pi.HashError)
 	}
 	for _, e := range d.LoadErrors {
 		fmt.Fprintf(&text, "  NOT LOADED: %s\n", e)
@@ -365,6 +410,12 @@ func runInventory(_ context.Context, env Env, args []string) (result, error) {
 		for _, k := range u.Decks {
 			fmt.Fprintf(&text, "  UNMATCHED deck (no profile is bound to it): %s\n", k)
 		}
+	}
+	for _, u := range d.Unrecognised {
+		fmt.Fprintf(&text, "  UNRECOGNISED device key (%d profile(s) bound): %s\n", u.Profiles, u.Key)
+	}
+	for _, e := range d.RawPrefs {
+		fmt.Fprintf(&text, "  RAW prefs entry (not a device record): %s, value type %s\n", e.Key, e.Type)
 	}
 	return result{data: d, text: text.String(), failed: len(d.LoadErrors) > 0}, nil
 }
@@ -429,8 +480,9 @@ func runDoctor(ctx context.Context, env Env, args []string) (result, error) {
 		// Only a file that is not valid JSON may be replaced; any other read
 		// error (permissions, I/O) is a hard error, so a valid file is never wiped.
 		known, knownErr := doctor.LoadKnown(h.Paths.StateDir())
+		corrupt := errors.Is(knownErr, doctor.ErrCorrupt)
 		if knownErr != nil {
-			if !errors.Is(knownErr, doctor.ErrCorrupt) {
+			if !corrupt && *accept {
 				return result{}, knownErr
 			}
 			known = doctor.Known{}
@@ -457,8 +509,12 @@ func runDoctor(ctx context.Context, env Env, args []string) (result, error) {
 			}
 		}
 		if knownErr != nil && !d.Accepted {
+			hint := "; review, then run `schrodeck doctor --accept-fingerprint` to replace it"
+			if !corrupt {
+				hint = "; fix the file (--accept-fingerprint will not replace it)"
+			}
 			d.Checks = append(d.Checks, probe.Result{ID: "FP", Contract: "C", Tier: probe.ReadOnly.String(), Status: probe.Fail,
-				Detail: "the known-good fingerprint set cannot be read: " + knownErr.Error() + "; review, then run `schrodeck doctor --accept-fingerprint` to replace it"})
+				Detail: "the known-good fingerprint set cannot be read: " + knownErr.Error() + hint})
 		} else {
 			d.Checks = append(d.Checks, probe.RunAll(ctx, []probe.Probe{doctor.Fingerprint(schema, digest, known)}, probe.ReadOnly)...)
 		}

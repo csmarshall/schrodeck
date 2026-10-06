@@ -8,7 +8,8 @@
 package macos
 
 import (
-	"encoding/base64"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"regexp"
@@ -49,12 +50,15 @@ func DropboxPaths(info []byte) []string {
 }
 
 // Plain converts plist-decoded values into JSON-friendly ones: data becomes
-// "base64:<…>", dates become RFC 3339 strings, containers are converted
+// "data:<length>:<first 12 hex of its sha256>", dates become RFC 3339 strings, containers are converted
 // recursively. Everything else is returned as is.
 func Plain(x any) any {
 	switch t := x.(type) {
 	case []byte:
-		return "base64:" + base64.StdEncoding.EncodeToString(t)
+		// Observation-only: the length and a short digest show whether the
+		// blob changed, never its bytes, and stay deterministic.
+		sum := sha256.Sum256(t)
+		return fmt.Sprintf("data:%d:%s", len(t), hex.EncodeToString(sum[:])[:12])
 	case time.Time:
 		return t.UTC().Format(time.RFC3339)
 	case map[string]any:

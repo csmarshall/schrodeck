@@ -62,8 +62,11 @@ func TestGeometryTablesAreConsistent(t *testing.T) {
 	if err := Validate(DeviceTypes, ProductTypes); err != nil {
 		t.Fatal(err)
 	}
-	// Known-bad: a product mapped to a type that has no observed grid.
-	if err := Validate(DeviceTypes, map[[2]int]int{{4057, 143}: 2}); err == nil {
+	// Known-bad: a product mapped to a type that has no observed grid. The
+	// table is local, so observing grids in the live DeviceTypes (Task 12)
+	// cannot turn this case into a valid one.
+	gridless := map[int]TypeInfo{2: {Name: "Stream Deck XL", Keys: 32}}
+	if err := Validate(gridless, map[[2]int]int{{4057, 143}: 2}); err == nil {
 		t.Fatal("a mapped DeviceType without columns/rows was accepted")
 	}
 	// Known-bad: a grid that contradicts R8's documented key count.
@@ -72,7 +75,7 @@ func TestGeometryTablesAreConsistent(t *testing.T) {
 		t.Fatal("an 8×3 grid for a 32-key type was accepted")
 	}
 	// Known-bad: a product mapped to a type R8 does not list.
-	if err := Validate(DeviceTypes, map[[2]int]int{{4057, 1}: 99}); err == nil {
+	if err := Validate(gridless, map[[2]int]int{{4057, 1}: 99}); err == nil {
 		t.Fatal("an unknown DeviceType was accepted")
 	}
 	// Known-good: a consistent pair derives the expected geometry.
@@ -183,5 +186,29 @@ func TestOnlyTypeOneIsPhysical(t *testing.T) {
 	_, unbound := Unmatched(records, nil)
 	if len(unbound) != 2 {
 		t.Errorf("Unmatched must list both keys, got %v", unbound)
+	}
+}
+
+func TestUnrecognisedListsEveryRejectedKey(t *testing.T) {
+	p, err := profile.Load(fixture.XL().FS(), fixture.XL().Folder())
+	if err != nil {
+		t.Fatal(err)
+	}
+	odd := "@(2)[4057/143/<deck>]"
+	p.Manifest.Lookup("Device", "UUID").SetString(odd)
+	records := []map[string]any{
+		{RecordKey: fixture.Device},
+		{RecordKey: odd},                                  // bound: used to vanish
+		{RecordKey: "not a device key"},                   // unbound
+		{RecordKey: "SomethingElse", RecordRaw: "opaque"}, // not a record: listed by RawEntries
+	}
+	got := Unrecognised(records, []*profile.Profile{p})
+	want := []UnrecognisedKey{{Key: odd, Profiles: 1}, {Key: "not a device key", Profiles: 0}}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("Unrecognised = %+v, want %+v", got, want)
+	}
+	raw := RawEntries(records)
+	if len(raw) != 1 || raw[0] != (RawEntry{Key: "SomethingElse", Type: "string"}) {
+		t.Fatalf("RawEntries = %+v", raw)
 	}
 }
