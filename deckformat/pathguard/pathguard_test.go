@@ -6,6 +6,7 @@ package pathguard
 
 import (
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -239,6 +240,122 @@ func TestRefuseInsideAbsentRoot(t *testing.T) {
 		}
 		if err := RefuseInside(filepath.Join(base, "Settings", "notyet-too", "x"), filepath.Join(base, "Settings", "notyet")); err != nil {
 			t.Fatalf("sibling sharing a prefix refused: %v", err)
+		}
+	})
+}
+
+// Create is the one way a command opens a new file at a path a person typed.
+func TestCreate(t *testing.T) {
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(base, "app")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	protected := filepath.Join(root, "manifest.json")
+	if err := os.WriteFile(protected, []byte("original"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(base, "out")
+	if err := os.MkdirAll(outside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	unchanged := func(t *testing.T) {
+		t.Helper()
+		got, err := os.ReadFile(protected)
+		if err != nil || string(got) != "original" {
+			t.Fatalf("the protected file changed: %q, %v", got, err)
+		}
+	}
+
+	t.Run("creates a new file, creating parents, and returns the resolved path", func(t *testing.T) {
+		f, got, err := Create(filepath.Join(outside, "a", "b", "new.txt"), root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		if want := filepath.Join(outside, "a", "b", "new.txt"); got != want {
+			t.Errorf("resolved path = %q, want %q", got, want)
+		}
+		if _, err := f.WriteString("x"); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("an existing file is never opened", func(t *testing.T) {
+		existing := filepath.Join(outside, "existing.txt")
+		if err := os.WriteFile(existing, []byte("keep"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		f, _, err := Create(existing, root)
+		if err == nil {
+			f.Close()
+			t.Fatal("Create opened an existing file")
+		}
+		if !errors.Is(err, fs.ErrExist) {
+			t.Errorf("err = %v, want fs.ErrExist", err)
+		}
+		if got, _ := os.ReadFile(existing); string(got) != "keep" {
+			t.Errorf("existing file now %q", got)
+		}
+	})
+	t.Run("a hard link to a protected file is not overwritten", func(t *testing.T) {
+		link := filepath.Join(outside, "linked.json")
+		if err := os.Link(protected, link); err != nil {
+			t.Skipf("no hard links here: %v", err)
+		}
+		f, _, err := Create(link, root)
+		if err == nil {
+			f.Close()
+			t.Fatal("Create opened a hard link to a protected file")
+		}
+		unchanged(t)
+	})
+	t.Run("a symlink into the root, then dotdot, is refused", func(t *testing.T) {
+		sub := filepath.Join(root, "sub")
+		if err := os.MkdirAll(sub, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		link := filepath.Join(outside, "into")
+		if err := os.Symlink(sub, link); err != nil {
+			t.Fatal(err)
+		}
+		f, _, err := Create(link+"/../x.txt", root)
+		if err == nil {
+			f.Close()
+		}
+		if !errors.Is(err, ErrInside) {
+			t.Fatalf("err = %v, want ErrInside", err)
+		}
+		if _, err := os.Stat(filepath.Join(root, "x.txt")); err == nil {
+			t.Error("a file was created inside the protected root")
+		}
+	})
+	t.Run("a target inside a root is refused and creates nothing", func(t *testing.T) {
+		target := filepath.Join(root, "deeper", "new.txt")
+		f, _, err := Create(target, root)
+		if err == nil {
+			f.Close()
+		}
+		if !errors.Is(err, ErrInside) {
+			t.Fatalf("err = %v, want ErrInside", err)
+		}
+		if _, err := os.Stat(filepath.Join(root, "deeper")); err == nil {
+			t.Error("the parent directory was created inside the protected root")
+		}
+	})
+	t.Run("every root is checked", func(t *testing.T) {
+		other := filepath.Join(base, "other")
+		if err := os.MkdirAll(other, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		f, _, err := Create(filepath.Join(other, "x.txt"), root, other)
+		if err == nil {
+			f.Close()
+		}
+		if !errors.Is(err, ErrInside) {
+			t.Fatalf("err = %v, want ErrInside", err)
 		}
 	})
 }

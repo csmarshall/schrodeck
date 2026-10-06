@@ -4,7 +4,17 @@
 
 // Package pathguard keeps writes out of protected directories, such as the
 // Stream Deck app's data root. Every command that writes to a path a person
-// typed checks the final target here first.
+// typed checks the final target here first, and Create is the writer that does
+// the check and the open together.
+//
+// Limits. Windows is compiled but untested, and M1 is macOS-only: SingleName and
+// Resolve do not handle NTFS alternate data streams, reserved device names
+// (CON, NUL, ...) or drive-relative paths (C:foo). On Linux the alias tests
+// skip, because the file system does not alias those spellings, and the string
+// fold layer over-refuses there (a name that only folds equal is refused although
+// the directories differ), which is the safe direction. One race no path check
+// closes: someone with write access renaming an ancestor of the target between
+// the check and the open; the re-check after the open narrows it.
 package pathguard
 
 import (
@@ -234,4 +244,47 @@ func Resolve(p string) (string, error) {
 		cur = next
 	}
 	return cur, nil
+}
+
+// Create opens a new file at target for writing, refusing anything inside the
+// protected roots, and returns the file with the resolved path it was created
+// at. It is the one writer for a path a person typed: the target is resolved
+// the way the kernel will (Resolve), checked (RefuseInside), its parent
+// directories are created, and the file is opened O_WRONLY|O_CREATE|O_EXCL, so
+// an existing file is never opened. That also covers a hard link: a name that
+// is another name for a protected file exists, so it is refused rather than
+// truncated. After the open the file is compared with the path (os.SameFile)
+// and the parent directory is checked against the roots again; on a mismatch
+// the file is closed and an error returned. It is not removed, because by then
+// the path may no longer name it.
+func Create(target string, roots ...string) (*os.File, string, error) {
+	resolved, err := Resolve(target)
+	if err != nil {
+		return nil, "", err
+	}
+	if err := RefuseInside(resolved, roots...); err != nil {
+		return nil, "", err
+	}
+	if err := os.MkdirAll(filepath.Dir(resolved), 0o755); err != nil {
+		return nil, "", err
+	}
+	f, err := os.OpenFile(resolved, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return nil, "", err
+	}
+	opened, err := f.Stat()
+	if err == nil {
+		var onDisk os.FileInfo
+		if onDisk, err = os.Stat(resolved); err == nil && !os.SameFile(opened, onDisk) {
+			err = fmt.Errorf("pathguard: %s changed while it was being created", resolved)
+		}
+	}
+	if err == nil {
+		err = RefuseInside(filepath.Dir(resolved), roots...)
+	}
+	if err != nil {
+		f.Close()
+		return nil, "", err
+	}
+	return f, resolved, nil
 }
