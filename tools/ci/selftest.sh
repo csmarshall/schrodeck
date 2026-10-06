@@ -39,6 +39,7 @@ require_detector check-headers.sh
 require_detector check-gofmt.sh
 require_detector leak-scan.sh
 require_detector set-leak-scan-secret.sh
+require_detector check-normhash-reference.sh
 
 # in_dir <dir> <command...>: run a command from inside a directory.
 in_dir() {
@@ -206,6 +207,28 @@ else
   echo "FAIL  set-leak-scan-secret sent unexpected bytes: $(od -An -c "$scratch/gh-stdin")"
   failures=$((failures + 1))
 fi
+
+# --- check-normhash-reference.sh (Go goldens vs the Python reference) ---------
+repo_root=$(cd "$here/../.." && pwd)
+real_test=$repo_root/deckformat/normhash/normhash_test.go
+real_ref=$repo_root/deckformat/normhash/testdata/refhash.py
+nh="$scratch/normhash"
+mkdir "$nh"
+# One hex digit off in the first golden constant (3... -> 4...).
+sed 's/^const goldenXL = "3/const goldenXL = "4/' "$real_test" >"$nh/test-off-by-one.go"
+# A constant that cannot be found at all.
+sed 's/^const goldenXL = /const renamedGolden = /' "$real_test" >"$nh/test-no-constant.go"
+# A reference that runs but prints no sha256.
+sed 's/^    print(hashlib/    pass  # print(hashlib/' "$real_ref" >"$nh/ref-silent.py"
+# Guard the mutations themselves: each must actually differ from the real file.
+if cmp -s "$real_test" "$nh/test-off-by-one.go" || cmp -s "$real_test" "$nh/test-no-constant.go" || cmp -s "$real_ref" "$nh/ref-silent.py"; then
+  echo "selftest: a normhash known-bad mutation did not apply" >&2
+  exit 1
+fi
+expect 0 "check-normhash-reference passes on the real goldens" in_dir "$repo_root" "$here/check-normhash-reference.sh"
+expect 1 "check-normhash-reference fails when a golden is one hex digit off" in_dir "$repo_root" env NORMHASH_TEST_FILE="$nh/test-off-by-one.go" "$here/check-normhash-reference.sh"
+expect 1 "check-normhash-reference fails when the reference prints no sha256" in_dir "$repo_root" env NORMHASH_REFERENCE="$nh/ref-silent.py" "$here/check-normhash-reference.sh"
+expect 1 "check-normhash-reference fails when a golden constant cannot be found" in_dir "$repo_root" env NORMHASH_TEST_FILE="$nh/test-no-constant.go" "$here/check-normhash-reference.sh"
 
 if [[ $failures -gt 0 ]]; then
   echo "selftest: $failures detector verdict(s) wrong" >&2
