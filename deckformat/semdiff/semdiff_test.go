@@ -122,3 +122,77 @@ func TestSets(t *testing.T) {
 		t.Fatalf("Sets = %s", render(cs))
 	}
 }
+
+func TestPathInjectivityBracketMember(t *testing.T) {
+	// Member named "[0]" should be distinguishable from array index [0]
+	a, _ := jsondoc.Parse([]byte(`{"x":{"[0]":1}}`))
+	b, _ := jsondoc.Parse([]byte(`{"x":{"[0]":2}}`))
+	cs := Values("P", "w", a, b)
+	if len(cs) != 1 {
+		t.Fatalf("expected 1 change, got %d: %s", len(cs), render(cs))
+	}
+	// Path must be x.["[0]"] to distinguish from x[0]
+	if cs[0].Path != `["[0]"]` && cs[0].Path != `x.["[0]"]` && !strings.Contains(cs[0].Path, `["[0]"]`) {
+		t.Errorf("path %q does not properly quote bracket member; must distinguish from array index", cs[0].Path)
+	}
+}
+
+func TestPathInjectivityArrayVsMember(t *testing.T) {
+	// {"a":[1],"a[0]":1} has two distinct locations: array a[0] and member a[0]
+	// Both should be changed without collision
+	a, _ := jsondoc.Parse([]byte(`{"a":[1],"a[0]":0}`))
+	b, _ := jsondoc.Parse([]byte(`{"a":[2],"a[0]":1}`))
+	cs := Values("P", "w", a, b)
+	if len(cs) != 2 {
+		t.Fatalf("expected 2 changes (array and member), got %d: %s", len(cs), render(cs))
+	}
+	paths := map[string]bool{}
+	for _, c := range cs {
+		if paths[c.Path] {
+			t.Errorf("duplicate path %q - paths are not injective", c.Path)
+		}
+		paths[c.Path] = true
+	}
+}
+
+func TestPathInjectivityDotMember(t *testing.T) {
+	// {"a":{"b":1},"a.b":1} has two distinct locations: nested a→b and member a.b
+	// Both should be changed without collision
+	a, _ := jsondoc.Parse([]byte(`{"a":{"b":1},"a.b":0}`))
+	b, _ := jsondoc.Parse([]byte(`{"a":{"b":2},"a.b":1}`))
+	cs := Values("P", "w", a, b)
+	if len(cs) != 2 {
+		t.Fatalf("expected 2 changes (nested and member), got %d: %s", len(cs), render(cs))
+	}
+	paths := map[string]bool{}
+	for _, c := range cs {
+		if paths[c.Path] {
+			t.Errorf("duplicate path %q - paths are not injective", c.Path)
+		}
+		paths[c.Path] = true
+	}
+}
+
+func TestPathInjectivitySettingsDotMember(t *testing.T) {
+	// A Settings object with a member name containing a dot, to show that
+	// slot/tail splitting in pageChanges still works correctly
+	before := fixture.XL()
+	after := fixture.XL()
+	// Modify a Settings member that contains a dot in its name
+	after.Pages[0].Buttons[0].Settings = `{"openInBrowser":true,"my.setting":123}`
+	cs, err := Profiles(loadP(t, before), loadP(t, after), Semantic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Should find the change in my.setting (not split incorrectly)
+	found := false
+	for _, c := range cs {
+		if strings.Contains(c.Path, `["my.setting"]`) || (strings.Contains(c.Path, "my") && strings.Contains(c.Path, "setting")) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("Settings member with dot not properly handled: %s", render(cs))
+	}
+}

@@ -23,6 +23,13 @@ import (
 	"github.com/csmarshall/schrodeck/deckformat/profile"
 )
 
+// seg represents a path segment: either a member name or an array index.
+type seg struct {
+	name  string // member name, empty if isIdx
+	idx   int    // array index, valid only if isIdx
+	isIdx bool   // true if this is an array index
+}
+
 // Kind of change.
 type Kind string
 
@@ -67,12 +74,58 @@ func (c Change) String() string {
 	return fmt.Sprintf("%s: %s changed: %s → %s", c.Profile, loc, c.Before, c.After)
 }
 
+// needsQuote reports whether a member name needs quoting in a path.
+func needsQuote(name string) bool {
+	if name == "" {
+		return true
+	}
+	for _, ch := range name {
+		if ch == '.' || ch == '[' || ch == ']' || ch == '"' {
+			return true
+		}
+	}
+	return false
+}
+
+// renderPathSegs converts structured segments into an injective string path,
+// quoting member names that contain special characters.
+func renderPathSegs(segments []seg) string {
+	if len(segments) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for i, s := range segments {
+		if s.isIdx {
+			b.WriteString(fmt.Sprintf("[%d]", s.idx))
+		} else {
+			// Add dot before member name if not the first segment
+			if i > 0 {
+				b.WriteByte('.')
+			}
+			if needsQuote(s.name) {
+				b.WriteString(`["`)
+				// Escape " and \ inside quoted names
+				for _, ch := range s.name {
+					if ch == '"' || ch == '\\' {
+						b.WriteByte('\\')
+					}
+					b.WriteRune(ch)
+				}
+				b.WriteString(`"]`)
+			} else {
+				b.WriteString(s.name)
+			}
+		}
+	}
+	return b.String()
+}
+
 // Values compares two JSON trees and returns one change per differing leaf.
 // where and profileName label every change.
 func Values(profileName, where string, a, b *jsondoc.Value) []Change {
 	var out []Change
-	emit := func(path []string, kind Kind, x, y *jsondoc.Value) {
-		c := Change{Profile: profileName, Where: where, Path: renderPath(path), Kind: kind}
+	emit := func(path []seg, kind Kind, x, y *jsondoc.Value) {
+		c := Change{Profile: profileName, Where: where, Path: renderPathSegs(path), Kind: kind}
 		if x != nil {
 			c.Before = string(x.Encode())
 		}
@@ -85,7 +138,7 @@ func Values(profileName, where string, a, b *jsondoc.Value) []Change {
 	return out
 }
 
-func diffValues(path []string, a, b *jsondoc.Value, emit func([]string, Kind, *jsondoc.Value, *jsondoc.Value)) {
+func diffValues(path []seg, a, b *jsondoc.Value, emit func([]seg, Kind, *jsondoc.Value, *jsondoc.Value)) {
 	switch {
 	case a == nil && b == nil:
 		return
@@ -104,11 +157,11 @@ func diffValues(path []string, a, b *jsondoc.Value, emit func([]string, Kind, *j
 		seen := map[string]bool{}
 		for _, m := range a.Members() {
 			seen[m.Name] = true
-			diffValues(append(path[:len(path):len(path)], m.Name), m.Value, b.Get(m.Name), emit)
+			diffValues(append(path[:len(path):len(path)], seg{name: m.Name}), m.Value, b.Get(m.Name), emit)
 		}
 		for _, m := range b.Members() {
 			if !seen[m.Name] {
-				emit(append(path[:len(path):len(path)], m.Name), Added, nil, m.Value)
+				emit(append(path[:len(path):len(path)], seg{name: m.Name}), Added, nil, m.Value)
 			}
 		}
 	case jsondoc.Array:
@@ -121,28 +174,13 @@ func diffValues(path []string, a, b *jsondoc.Value, emit func([]string, Kind, *j
 			if i < len(bi) {
 				y = bi[i]
 			}
-			diffValues(append(path[:len(path):len(path)], "["+strconv.Itoa(i)+"]"), x, y, emit)
+			diffValues(append(path[:len(path):len(path)], seg{idx: i, isIdx: true}), x, y, emit)
 		}
 	default:
 		if !bytes.Equal(a.Raw(), b.Raw()) {
 			emit(path, Modified, a, b)
 		}
 	}
-}
-
-func renderPath(path []string) string {
-	var b strings.Builder
-	for _, p := range path {
-		if strings.HasPrefix(p, "[") {
-			b.WriteString(p)
-			continue
-		}
-		if b.Len() > 0 {
-			b.WriteByte('.')
-		}
-		b.WriteString(p)
-	}
-	return b.String()
 }
 
 // humanPage turns a canonical page label into words.
@@ -163,41 +201,85 @@ func humanPage(label string) string {
 
 // pageChanges compares two page manifests and moves the key slot out of the
 // path into Where: "page 1 › key 3,1" + "Settings.path".
+// It works on the structured path representation to avoid re-splitting collisions.
 func pageChanges(profileName, page string, a, b *jsondoc.Value) []Change {
 	var out []Change
-	for _, c := range Values(profileName, page, a, b) {
-		parts := strings.SplitN(c.Path, ".", 3)
-		// Controllers[i].Actions.<slot>[.rest]
-		if len(parts) >= 2 && strings.HasPrefix(parts[0], "Controllers[") && strings.HasPrefix(parts[1], "Actions") {
-			rest := ""
-			if len(parts) == 3 {
-				rest = parts[2]
+
+	// Walk through differences and rebuild paths from segments
+	emit := func(path []seg, kind Kind, x, y *jsondoc.Value) {
+		// Check if this is a Controllers[i].Actions.<slot> path
+		if len(path) >= 2 &&
+			path[0].name == "Controllers" &&
+			path[0].isIdx == false &&
+			path[1].isIdx == true &&
+			len(path) >= 3 &&
+			path[2].name == "Actions" &&
+			path[2].isIdx == false {
+
+			// Extract the controller index
+			ctlIdx := path[1].idx
+
+			// Everything after Controllers[i].Actions should be the slot and tail
+			slot := ""
+			var tail []seg
+			if len(path) > 3 {
+				// Next segment is the slot name
+				slot = path[3].name
+				// Everything after is the tail
+				if len(path) > 4 {
+					tail = path[4:]
+				}
 			}
-			slot, tail, _ := strings.Cut(rest, ".")
+
 			if slot != "" {
 				control := "key"
-				if ctl := controllerType(a, b, parts[0]); ctl == "Encoder" {
+				if ctl := controllerType(a, b, ctlIdx); ctl == "Encoder" {
 					control = "dial"
 				}
-				c.Where = page + " › " + control + " " + slot
-				c.Path = tail
+
+				c := Change{
+					Profile: profileName,
+					Where:   page + " › " + control + " " + slot,
+					Path:    renderPathSegs(tail),
+					Kind:    kind,
+				}
+				if x != nil {
+					c.Before = string(x.Encode())
+				}
+				if y != nil {
+					c.After = string(y.Encode())
+				}
+				out = append(out, c)
+				return
 			}
+		}
+
+		// Not a controller slot, emit as normal
+		c := Change{
+			Profile: profileName,
+			Where:   page,
+			Path:    renderPathSegs(path),
+			Kind:    kind,
+		}
+		if x != nil {
+			c.Before = string(x.Encode())
+		}
+		if y != nil {
+			c.After = string(y.Encode())
 		}
 		out = append(out, c)
 	}
+
+	diffValues(nil, a, b, emit)
 	return out
 }
 
-// controllerType returns the Type of the controller named by "Controllers[i]".
-func controllerType(a, b *jsondoc.Value, elem string) string {
-	i, err := strconv.Atoi(strings.TrimSuffix(strings.TrimPrefix(elem, "Controllers["), "]"))
-	if err != nil {
-		return ""
-	}
+// controllerType returns the Type of the controller at the given index.
+func controllerType(a, b *jsondoc.Value, idx int) string {
 	for _, m := range []*jsondoc.Value{b, a} {
 		items := m.Get("Controllers").Items()
-		if i < len(items) {
-			if s, ok := items[i].Get("Type").Str(); ok {
+		if idx < len(items) {
+			if s, ok := items[idx].Get("Type").Str(); ok {
 				return s
 			}
 		}
@@ -252,14 +334,16 @@ func docChanges(name string, a, b map[string]*jsondoc.Value) []Change {
 
 func rawChanges(name string, before, after *profile.Profile) ([]Change, error) {
 	out := Values(name, "profile", before.Manifest, after.Manifest)
-	labels := func(p *profile.Profile) map[string]string {
-		l, err := normhash.PageLabels(p)
-		if err != nil {
-			l = map[string]string{}
-		}
-		return l
+
+	la, err := normhash.PageLabels(before)
+	if err != nil {
+		return nil, fmt.Errorf("page labels (before): %w", err)
 	}
-	la, lb := labels(before), labels(after)
+	lb, err := normhash.PageLabels(after)
+	if err != nil {
+		return nil, fmt.Errorf("page labels (after): %w", err)
+	}
+
 	keys := map[string]bool{}
 	for k := range before.Pages {
 		keys[k] = true
