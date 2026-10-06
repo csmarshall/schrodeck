@@ -440,6 +440,16 @@ func TestSecretsAreRedactedEverywhere(t *testing.T) {
 		{`[{"key":"apiKey","value":{"v":"nv2"}}]`, "nv2"},
 		{`{"payload":"{\"token\":\"emb1\"}"}`, "emb1"},
 		{`{"payload":"[{\"name\":\"secret\",\"value\":\"emb2\"}]"}`, "emb2"},
+		{`{"payload":"{\"token\": \"emb3\"}"}`, "emb3"},
+		{`{"payload":"{\n  \"token\": \"emb4\",\n  \"n\": [1, 2]\n}\n"}`, "emb4"},
+		{`{"payload":"  {\"token\":\"emb5\"}"}`, "emb5"},
+		{`{"payload":"[ {\"name\": \"token\", \"value\": \"emb6\"} ]"}`, "emb6"},
+		{`{"payload":"{\"outer\": {\"password\": \"emb7\", \"p\": \"` + realHome + `\"}}"}`, "alice"},
+		{`{"payload":"{\"token\":\"dup1\",\"token\":\"dup2\", \"n\": 1.5}"}`, "dup"},
+		{`{"u":"https://x/#access_token=frag1"}`, "frag1"},
+		{`{"u":"https://x/?a=1#id_token=frag2"}`, "frag2"},
+		{`{"h":"Authorization: Bearer br3"}`, "br3"},
+		{`{"h":"curl -H 'authorization: bearer   br4' x"}`, "br4"},
 	}
 	for _, c := range cases {
 		if out := redactJSON(t, r, c[0]); strings.Contains(out, c[1]) {

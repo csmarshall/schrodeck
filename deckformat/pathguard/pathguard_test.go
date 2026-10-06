@@ -187,3 +187,40 @@ func TestRefuseInsideAliases(t *testing.T) {
 		})
 	}
 }
+
+// A root that does not exist yet can still be aliased: the write would create
+// it. The deepest existing ancestor is compared by identity and the missing
+// tail by case folding and NFC, so the long-s spelling of an absent root is
+// refused, with or without a file system that folds case.
+func TestRefuseInsideAbsentRoot(t *testing.T) {
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(base, "Settings"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	longS := "Setting\xc5\xbf"
+	t.Run("existing parent, absent leaf", func(t *testing.T) {
+		requireAlias(t, filepath.Join(base, longS))
+		target := filepath.Join(base, longS, "notyet", "x")
+		if err := RefuseInside(target, filepath.Join(base, "Settings", "notyet")); !errors.Is(err, ErrInside) {
+			t.Fatalf("RefuseInside(%q) = %v, want ErrInside", target, err)
+		}
+	})
+	t.Run("everything absent", func(t *testing.T) {
+		target := filepath.Join(base, "Absent"+longS[len(longS)-2:], "x")
+		root := filepath.Join(base, "Absents")
+		if err := RefuseInside(target, root); !errors.Is(err, ErrInside) {
+			t.Fatalf("RefuseInside(%q) = %v, want ErrInside", target, err)
+		}
+	})
+	t.Run("a different absent name is allowed", func(t *testing.T) {
+		if err := RefuseInside(filepath.Join(base, "Other", "x"), filepath.Join(base, "Settings", "notyet")); err != nil {
+			t.Fatalf("unrelated path refused: %v", err)
+		}
+		if err := RefuseInside(filepath.Join(base, "Settings", "notyet-too", "x"), filepath.Join(base, "Settings", "notyet")); err != nil {
+			t.Fatalf("sibling sharing a prefix refused: %v", err)
+		}
+	})
+}

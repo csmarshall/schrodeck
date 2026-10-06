@@ -14,6 +14,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"golang.org/x/text/unicode/norm"
 )
 
 // ErrInside means a write target lies inside a protected root.
@@ -36,13 +38,14 @@ var ErrNotName = errors.New("pathguard: not a single path element")
 // does not reproduce, and Unicode normalization all name one directory in
 // several ways. A cheap case-insensitive string comparison runs first and can
 // only add refusals, never remove them. A root that does not exist yet is
-// compared by string only, since nothing can alias a directory that is absent.
+// compared through its deepest existing ancestor (identity) plus its missing
+// tail (NFC and case folding), since a write would create it.
 func RefuseInside(target string, roots ...string) error {
 	t, err := Resolve(target)
 	if err != nil {
 		return err
 	}
-	var chain []os.FileInfo // created lazily: only needed when a root exists
+	var chain []ancestor // created lazily: only needed when a root is checked by identity
 	for _, root := range roots {
 		if root == "" {
 			continue
@@ -51,39 +54,70 @@ func RefuseInside(target string, roots ...string) error {
 		if err != nil {
 			return err
 		}
+		inside := fmt.Errorf("%w: %s is inside %s", ErrInside, target, root)
 		if within(strings.ToLower(r), strings.ToLower(t)) {
-			return fmt.Errorf("%w: %s is inside %s", ErrInside, target, root)
-		}
-		ri, err := os.Stat(r)
-		if errors.Is(err, fs.ErrNotExist) {
-			continue
-		}
-		if err != nil {
-			return err
+			return inside
 		}
 		if chain == nil {
 			if chain, err = ancestors(t); err != nil {
 				return err
 			}
 		}
+		ri, err := os.Stat(r)
+		if err == nil {
+			for _, a := range chain {
+				if os.SameFile(a.info, ri) {
+					return inside
+				}
+			}
+			continue
+		}
+		if !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+		// The root does not exist yet, so a write could create it. Find its
+		// deepest existing ancestor and see whether the target passes through
+		// the same directory (by identity) and continues with the root's missing
+		// tail, spelled any way that folds to the same name.
+		rootChain, err := ancestors(r)
+		if err != nil {
+			return err
+		}
+		if len(rootChain) == 0 {
+			continue
+		}
+		rootAnc := rootChain[0]
+		rootTail, ok := tailAfter(rootAnc.path, r)
+		if !ok {
+			continue
+		}
 		for _, a := range chain {
-			if os.SameFile(a, ri) {
-				return fmt.Errorf("%w: %s is inside %s", ErrInside, target, root)
+			if !os.SameFile(a.info, rootAnc.info) {
+				continue
+			}
+			if tt, ok := tailAfter(a.path, t); ok && hasFoldedPrefix(tt, rootTail) {
+				return inside
 			}
 		}
 	}
 	return nil
 }
 
+// ancestor is an existing directory on the way from a path up to the top.
+type ancestor struct {
+	path string
+	info os.FileInfo
+}
+
 // ancestors returns the identity of every existing directory on the way from p
-// up to the top, p itself included when it exists.
-func ancestors(p string) ([]os.FileInfo, error) {
-	var out []os.FileInfo
+// up to the top, p itself included when it exists, deepest first.
+func ancestors(p string) ([]ancestor, error) {
+	var out []ancestor
 	for cur := p; ; {
 		fi, err := os.Stat(cur)
 		switch {
 		case err == nil:
-			out = append(out, fi)
+			out = append(out, ancestor{cur, fi})
 		case errors.Is(err, fs.ErrNotExist):
 		default:
 			return nil, err
@@ -94,6 +128,32 @@ func ancestors(p string) ([]os.FileInfo, error) {
 		}
 		cur = parent
 	}
+}
+
+// tailAfter returns the path elements of full below prefix.
+func tailAfter(prefix, full string) ([]string, bool) {
+	rel, err := filepath.Rel(prefix, full)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return nil, false
+	}
+	if rel == "." {
+		return nil, true
+	}
+	return strings.Split(rel, string(filepath.Separator)), true
+}
+
+// hasFoldedPrefix reports whether the elements of prefix are the leading
+// elements of path, comparing each under NFC normalization and case folding.
+func hasFoldedPrefix(path, prefix []string) bool {
+	if len(prefix) > len(path) {
+		return false
+	}
+	for i, p := range prefix {
+		if !strings.EqualFold(norm.NFC.String(path[i]), norm.NFC.String(p)) {
+			return false
+		}
+	}
+	return true
 }
 
 // SingleName returns ErrNotName unless name is one path element: not empty,

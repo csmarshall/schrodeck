@@ -17,6 +17,7 @@ package redact
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"image"
@@ -60,8 +61,10 @@ var (
 	// substrings, so "mapping" and "bypass" are left alone.
 	secretSubstring = regexp.MustCompile(`(?i)(token|secret|passw|api[_-]?key|private[_-]?key|access[_-]?key|auth|cookie|session|credential|bearer)`)
 	// A query parameter: ?key=value, &key=value or ;key=value.
-	queryParam = regexp.MustCompile(`([?&;])([^=&#\s"'<>]+)=([^&#\s"'<>]*)`)
+	queryParam = regexp.MustCompile(`([?&;#])([^=&#\s"'<>]+)=([^&#\s"'<>]*)`)
 	uuidRe     = regexp.MustCompile(`(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
+	// An Authorization-style bearer credential, whatever member holds it.
+	bearerValue = regexp.MustCompile(`(?i)\bBearer\s+\S+`)
 	// An already-redacted serial, so redacting twice does not renumber it.
 	deckPlaceholder = regexp.MustCompile(`^<deck\d*>$`)
 )
@@ -278,6 +281,7 @@ func (r *Redactor) String(s string) string {
 	})
 	s = homeDir.ReplaceAllString(s, "${1}"+User)
 	s = homeDirEnc.ReplaceAllString(s, "${1}"+User)
+	s = bearerValue.ReplaceAllString(s, "Bearer "+Redacted)
 	s = queryParam.ReplaceAllStringFunc(s, func(q string) string {
 		m := queryParam.FindStringSubmatch(q)
 		key := m[2]
@@ -312,12 +316,10 @@ func (r *Redactor) redactInPlace(v *jsondoc.Value) {
 		s, _ := v.Str()
 		// JSON embedded in a string (plugins store settings that way) is parsed,
 		// redacted as a document and put back.
-		if t := strings.TrimSpace(s); len(t) > 1 && (t[0] == '{' || t[0] == '[') {
-			if inner, err := jsondoc.Parse([]byte(s)); err == nil && (inner.Kind() == jsondoc.Object || inner.Kind() == jsondoc.Array) {
-				r.redactInPlace(inner)
-				v.SetString(string(inner.Encode()))
-				return
-			}
+		if inner := parseEmbedded(s); inner != nil {
+			r.redactInPlace(inner)
+			v.SetString(string(inner.Encode()))
+			return
 		}
 		if red := r.String(s); red != s {
 			v.SetString(red)
@@ -347,6 +349,59 @@ func (r *Redactor) redactInPlace(v *jsondoc.Value) {
 			r.redactInPlace(it)
 		}
 	}
+}
+
+// parseEmbedded returns the document inside s when the trimmed string is valid
+// JSON with an object or array at the top, in any formatting; nil otherwise. A
+// document that is not already compact is re-encoded compactly, so the format
+// of the embedded string changes when it is redacted.
+func parseEmbedded(s string) *jsondoc.Value {
+	t := strings.TrimSpace(s)
+	if len(t) < 2 || (t[0] != '{' && t[0] != '[') || !json.Valid([]byte(t)) {
+		return nil
+	}
+	if v, err := jsondoc.Parse([]byte(t)); err == nil {
+		return v
+	}
+	var compact bytes.Buffer
+	if err := json.Compact(&compact, []byte(t)); err == nil {
+		if v, err := jsondoc.Parse(compact.Bytes()); err == nil {
+			return v
+		}
+	}
+	// Last resort (for example duplicate member names, which jsondoc refuses):
+	// decode generically. Later duplicates win; numbers keep integer or float form.
+	dec := json.NewDecoder(strings.NewReader(t))
+	dec.UseNumber()
+	var x any
+	if err := dec.Decode(&x); err != nil {
+		return nil
+	}
+	v, err := jsondoc.FromAny(numbersToNative(x))
+	if err != nil {
+		return nil
+	}
+	return v
+}
+
+func numbersToNative(x any) any {
+	switch t := x.(type) {
+	case json.Number:
+		if i, err := t.Int64(); err == nil {
+			return i
+		}
+		f, _ := t.Float64()
+		return f
+	case []any:
+		for i := range t {
+			t[i] = numbersToNative(t[i])
+		}
+	case map[string]any:
+		for k := range t {
+			t[k] = numbersToNative(t[k])
+		}
+	}
+	return x
 }
 
 // blank replaces every scalar under v, at any depth, by Redacted. Member names
