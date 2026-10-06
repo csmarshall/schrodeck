@@ -1,6 +1,6 @@
 # 0003. Decks are local; compatibility is by geometry
 
-Status: Accepted 2026-10-01
+Status: Accepted 2026-10-01 Revised 2026-10-02 (M1, implementation): R8 documents key and dial counts per DeviceType but not the columns × rows split; a physical deck's DeviceType is found through an observed USB product → DeviceType map, and the split is observed and checked against R8's key count. Virtual decks remain in scope; their grid source (U8) is settled in M1.
 
 ## Context
 
@@ -35,7 +35,7 @@ Elgato documents a DeviceType table with key-grid sizes (columns × rows, plus d
 ## Verified by
 
 No check yet; to be written in the plan:
-- A geometry-table test that fails if a known DeviceType lacks columns/rows.
+- A geometry-table test that fails if a mapped DeviceType lacks columns/rows, or if a grid does not multiply to R8's key count: `TestGeometryTablesAreConsistent` (M1 Task 10), with known-bad tables.
 - A subscribe test that fails when binding a 32-key profile to a 15-key deck.
 
 ## References
