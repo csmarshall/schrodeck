@@ -1,6 +1,6 @@
 # 0015. Schema guard: stop when the app's files change shape
 
-Status: Accepted 2026-10-01. Revised 2026-10-01 (review F5): the guard blocks pushes as well as applies; incoming revisions are checked against this host's known-good fingerprints; the file-pattern set is part of the fingerprint; the app bundle is watched by the resident agent. Revised 2026-10-01 (review round 2: F32, F39): the fingerprint is defined exactly and excludes the app version, so patch updates that don't change the format don't stop sync; the read-only `doctor` pass that M2 needs is separated from M3's app-restarting probes.
+Status: Accepted 2026-10-01. Revised 2026-10-01 (review F5): the guard blocks pushes as well as applies; incoming revisions are checked against this host's known-good fingerprints; the file-pattern set is part of the fingerprint; the app bundle is watched by the resident agent. Revised 2026-10-01 (review round 2: F32, F39): the fingerprint is defined exactly and excludes the app version, so patch updates that don't change the format don't stop sync; the read-only `doctor` pass that M2 needs is separated from M3's app-restarting probes. Revised 2026-10-02 (M1, implementation): key paths collapse array indices to `[]` and the key-slot member names under `Actions` to `*`, and stop at `Settings` (plugin-defined content); paths carry a `manifest:` or `page:` prefix. Whether the content-dependent key set (e.g. `AppIdentifier` only on some profiles) makes the fingerprint flap on ordinary edits is measured in M1 (observation F1) before M2 relies on it.
 
 ## Context
 

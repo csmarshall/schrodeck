@@ -21,6 +21,7 @@ Index of all contracts: [README.md](README.md).
 | P10 | Two profiles on one host may carry the **same** `ActionID`s | **unknown; informational only** (review F51) | not a gate: every install **always regenerates** `ActionID`s deterministically (ADR [0026](../adr/0026-profile-identity.md)), so schrodeck never creates duplicates, not even between a template and its first member copy. The restart-tier probe still records what the app does with a duplicate, for the record |
 | P8 | Actions that switch to or open **another profile** (e.g. a switch-profile action) reference the target by that profile's **folder UUID**, and may also embed a device id | **likely, unverified** (review F46) | scan action settings for UUID-shaped values that match another local `.sdProfile` folder name, and for `@(` device ids. Report each reference with its key path. A matched profile reference is an inventory dependency (ADR [0013](../adr/0013-sync-scope-and-scripts.md)); a device id other than this copy's own makes the copy **DETACHED(foreign-device-id)** (ADR [0030](../adr/0030-fail-closed-detach.md), review F56) |
 | P11 | Page folder UUIDs are per copy: the same page in two profiles has different `Profiles/<page>` folder names. The ordered `Pages.Pages` list and `Pages.Default` refer to pages by those UUIDs | observed [R20](../references.md) (the copied page's folder UUID differed) | read-only: in the fixture pair, the normalized hashes are equal only with page canonicalization (step 2 below). Known-bad: hashing raw page UUIDs reports the pair as different. How a **folder** button references its sub-page is still unknown (config model U-row P9), so folder sub-pages are not canonicalized yet |
+| P12 | Manifests are compact JSON: no indentation or other insignificant whitespace, members in the order the app wrote them, no trailing newline | observed by hand (one Mac, app 7.5.1, three profiles, 2026-10-02; R-row added in Task 12) | the loader (P1) re-encodes every manifest and refuses any that do not round-trip byte for byte, naming the file; a formatting change by the app therefore fails P1 with a not-round-trip error instead of being rewritten |
 
 ## File allow-list
 
@@ -31,7 +32,7 @@ Relative to the `<UUID>.sdProfile/` folder. The folder's own name is never part 
 - `Profiles/<page>/manifest.json`
 - `Profiles/<page>/Images/*`
 
-Known junk is **ignored silently** for hashing and copying: `.DS_Store`, sync-client artifacts (`* (conflicted copy)*`, `*.icloud`, `~$*`), and editor temp files. Any other file outside the allow-list trips P7, because it may be app data we don't understand.
+Known junk is **ignored silently** for hashing and copying: `.DS_Store`, sync-client artifacts (`* (conflicted copy)*`, `*.icloud`, `~$*`), and editor temp files (`*~`, `.*.swp`, `#*#`). Any other file outside the allow-list trips P7, because it may be app data we don't understand.
 
 ## Normalized hash
 
