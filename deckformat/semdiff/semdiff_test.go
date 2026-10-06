@@ -5,6 +5,7 @@
 package semdiff
 
 import (
+	"sort"
 	"strings"
 	"testing"
 
@@ -132,13 +133,13 @@ func TestPathInjectivityBracketMember(t *testing.T) {
 		t.Fatalf("expected 1 change, got %d: %s", len(cs), render(cs))
 	}
 	// Path must be x.["[0]"] to distinguish from x[0]
-	if cs[0].Path != `["[0]"]` && cs[0].Path != `x.["[0]"]` && !strings.Contains(cs[0].Path, `["[0]"]`) {
-		t.Errorf("path %q does not properly quote bracket member; must distinguish from array index", cs[0].Path)
+	if cs[0].Path != `x.["[0]"]` {
+		t.Errorf("BracketMember path: got %q, want %q", cs[0].Path, `x.["[0]"]`)
 	}
 }
 
 func TestPathInjectivityArrayVsMember(t *testing.T) {
-	// {"a":[1],"a[0]":1} has two distinct locations: array a[0] and member a[0]
+	// {"a":[1],"a[0]":1} has two distinct locations: array a[0] and member "a[0]"
 	// Both should be changed without collision
 	a, _ := jsondoc.Parse([]byte(`{"a":[1],"a[0]":0}`))
 	b, _ := jsondoc.Parse([]byte(`{"a":[2],"a[0]":1}`))
@@ -146,17 +147,18 @@ func TestPathInjectivityArrayVsMember(t *testing.T) {
 	if len(cs) != 2 {
 		t.Fatalf("expected 2 changes (array and member), got %d: %s", len(cs), render(cs))
 	}
-	paths := map[string]bool{}
-	for _, c := range cs {
-		if paths[c.Path] {
-			t.Errorf("duplicate path %q - paths are not injective", c.Path)
-		}
-		paths[c.Path] = true
+	// The two paths should be exactly "a[0]" (array index) and `["a[0]"]` (quoted member name)
+	paths := []string{cs[0].Path, cs[1].Path}
+	sort.Strings(paths)
+	expectedPaths := []string{`a[0]`, `["a[0]"]`}
+	sort.Strings(expectedPaths)
+	if paths[0] != expectedPaths[0] || paths[1] != expectedPaths[1] {
+		t.Errorf("ArrayVsMember paths: got %q, want %q and %q", paths, expectedPaths[0], expectedPaths[1])
 	}
 }
 
 func TestPathInjectivityDotMember(t *testing.T) {
-	// {"a":{"b":1},"a.b":1} has two distinct locations: nested a→b and member a.b
+	// {"a":{"b":1},"a.b":1} has two distinct locations: nested a→b and member "a.b"
 	// Both should be changed without collision
 	a, _ := jsondoc.Parse([]byte(`{"a":{"b":1},"a.b":0}`))
 	b, _ := jsondoc.Parse([]byte(`{"a":{"b":2},"a.b":1}`))
@@ -164,12 +166,13 @@ func TestPathInjectivityDotMember(t *testing.T) {
 	if len(cs) != 2 {
 		t.Fatalf("expected 2 changes (nested and member), got %d: %s", len(cs), render(cs))
 	}
-	paths := map[string]bool{}
-	for _, c := range cs {
-		if paths[c.Path] {
-			t.Errorf("duplicate path %q - paths are not injective", c.Path)
-		}
-		paths[c.Path] = true
+	// The two paths should be exactly "a.b" (nested) and `["a.b"]` (quoted member name)
+	paths := []string{cs[0].Path, cs[1].Path}
+	sort.Strings(paths)
+	expectedPaths := []string{`a.b`, `["a.b"]`}
+	sort.Strings(expectedPaths)
+	if paths[0] != expectedPaths[0] || paths[1] != expectedPaths[1] {
+		t.Errorf("DotMember paths: got %q, want %q and %q", paths, expectedPaths[0], expectedPaths[1])
 	}
 }
 
@@ -184,15 +187,30 @@ func TestPathInjectivitySettingsDotMember(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Should find the change in my.setting (not split incorrectly)
+	// Should find exactly one change with the quoted member in Settings
 	found := false
 	for _, c := range cs {
-		if strings.Contains(c.Path, `["my.setting"]`) || (strings.Contains(c.Path, "my") && strings.Contains(c.Path, "setting")) {
+		if c.Where == "page 1 › key 0,0" && c.Path == `Settings.["my.setting"]` {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Errorf("Settings member with dot not properly handled: %s", render(cs))
+		t.Errorf("SettingsDotMember: expected Where=%q Path=%q in %s", "page 1 › key 0,0", `Settings.["my.setting"]`, render(cs))
+	}
+}
+
+func TestPathEscaping(t *testing.T) {
+	// Member name containing both " and \ should be escaped correctly
+	a, _ := jsondoc.Parse([]byte(`{"x":{"a\"b\\c":1}}`))
+	b, _ := jsondoc.Parse([]byte(`{"x":{"a\"b\\c":2}}`))
+	cs := Values("P", "w", a, b)
+	if len(cs) != 1 {
+		t.Fatalf("expected 1 change, got %d: %s", len(cs), render(cs))
+	}
+	// Path should have both " and \ properly escaped inside the quotes
+	expected := `x.["a\"b\\c"]`
+	if cs[0].Path != expected {
+		t.Errorf("escaping path: got %q, want %q", cs[0].Path, expected)
 	}
 }

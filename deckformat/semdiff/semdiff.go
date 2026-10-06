@@ -7,6 +7,12 @@
 // compares manifests as stored, runtime fields and ids included, which is
 // what observing the app needs. Semantic mode compares the normalized forms
 // of contract C, which is what "did the user change anything" needs.
+//
+// Path grammar: a path is a sequence of member names and array indices joined injectively.
+// A member name is rendered as-is if it contains only alphanumerics and underscore; otherwise
+// it is quoted as ["…"] with internal " and \ escaped. Array indices are rendered as [i].
+// Between segments: no prefix for the first segment; subsequent member names are prefixed with ".";
+// array indices have no prefix dot (e.g., "a[0].b" for nested access, 'a.["[0]"]' for member named "[0]").
 package semdiff
 
 import (
@@ -96,7 +102,7 @@ func renderPathSegs(segments []seg) string {
 	var b strings.Builder
 	for i, s := range segments {
 		if s.isIdx {
-			b.WriteString(fmt.Sprintf("[%d]", s.idx))
+			fmt.Fprintf(&b, "[%d]", s.idx)
 		} else {
 			// Add dot before member name if not the first segment
 			if i > 0 {
@@ -208,11 +214,10 @@ func pageChanges(profileName, page string, a, b *jsondoc.Value) []Change {
 	// Walk through differences and rebuild paths from segments
 	emit := func(path []seg, kind Kind, x, y *jsondoc.Value) {
 		// Check if this is a Controllers[i].Actions.<slot> path
-		if len(path) >= 2 &&
+		if len(path) >= 3 &&
 			path[0].name == "Controllers" &&
 			path[0].isIdx == false &&
 			path[1].isIdx == true &&
-			len(path) >= 3 &&
 			path[2].name == "Actions" &&
 			path[2].isIdx == false {
 
