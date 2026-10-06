@@ -261,3 +261,40 @@ func TestSemanticIgnoresSpellingTheHashIgnores(t *testing.T) {
 		})
 	}
 }
+
+func TestParsePathInvertsRendering(t *testing.T) {
+	cases := [][]seg{
+		{{name: "a"}, {name: "b"}},
+		{{name: "x"}, {name: "[0]"}},
+		{{name: "a"}, {idx: 0, isIdx: true}},
+		{{name: "a[0]"}},
+		{{name: "a.b"}},
+		{{name: "x"}, {name: `a"b\c`}},
+		{{name: ""}, {name: "k"}},
+		{{name: "a"}, {idx: 12, isIdx: true}, {idx: 3, isIdx: true}, {name: "z"}},
+		{{idx: 1, isIdx: true}, {name: "q"}},
+		{{name: `\`}},
+	}
+	for _, segs := range cases {
+		path := renderPathSegs(segs)
+		got, err := ParsePath(path)
+		if err != nil {
+			t.Errorf("ParsePath(%q): %v", path, err)
+			continue
+		}
+		if len(got) != len(segs) {
+			t.Errorf("ParsePath(%q) = %v", path, got)
+			continue
+		}
+		for i := range segs {
+			if got[i] != (Segment{Name: segs[i].name, Index: segs[i].idx, IsIndex: segs[i].isIdx}) {
+				t.Errorf("ParsePath(%q)[%d] = %+v, want %+v", path, i, got[i], segs[i])
+			}
+		}
+	}
+	for _, bad := range []string{"a.", "a..b", `["x`, `["x"`, "[x]", "[]", "a[1", "a b.", `a["x"]`, "[99999999999999999999]"} {
+		if _, err := ParsePath(bad); err == nil {
+			t.Errorf("ParsePath(%q) accepted a string the renderer never produces", bad)
+		}
+	}
+}

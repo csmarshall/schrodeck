@@ -221,3 +221,143 @@ func TestSaveNeverClobbers(t *testing.T) {
 		t.Fatalf("victim was overwritten: %q", b)
 	}
 }
+
+func settingsXL(t *testing.T, settings string) fixture.Profile {
+	t.Helper()
+	p := fixture.XL()
+	p.Pages[0].Buttons[0].Settings = settings
+	return p
+}
+
+func TestSecretNamedValuesNeverReachTheReport(t *testing.T) {
+	const (
+		oldTok, newTok = "sec-one-AAA", "sec-two-BBB"
+		oldN, newN     = "nest-one-CCC", "nest-two-DDD"
+		oldP, newP     = "pref-one-EEE", "pref-two-FFF"
+	)
+	mkPrefs := func(tok string) *jsondoc.Value {
+		v, err := jsondoc.FromAny(map[string]any{"Token": tok, "Harmless": "same"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	before := take(t, settingsXL(t, `{"apiToken":"`+oldTok+`","auth":{"inner":"`+oldN+`"},"label":"a"}`), mkPrefs(oldP), t0)
+	after := take(t, settingsXL(t, `{"apiToken":"`+newTok+`","auth":{"inner":"`+newN+`"},"label":"b"}`), mkPrefs(newP), t0.Add(time.Minute))
+	rep, err := Compare("secrets", before, after, redactor(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := rep.Markdown() + "\n" + rep.EvidenceRow()
+	for _, leak := range []string{oldTok, newTok, oldN, newN, oldP, newP} {
+		if strings.Contains(out, leak) {
+			t.Errorf("report leaks %q:\n%s", leak, out)
+		}
+	}
+	// The non-secret sibling is still reported, so blanking is not wholesale.
+	if !strings.Contains(out, `"b"`) {
+		t.Errorf("non-secret change vanished:\n%s", out)
+	}
+	// Known-bad control: the raw diff does carry every secret.
+	raw, err := semdiff.Sets(before.Profiles, after.Profiles, semdiff.Raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rawText strings.Builder
+	for _, c := range append(raw, semdiff.Values("app preferences", "prefs", before.Prefs, after.Prefs)...) {
+		rawText.WriteString(c.String() + "\n")
+	}
+	for _, secret := range []string{oldTok, newTok, oldN, newN, oldP, newP} {
+		if !strings.Contains(rawText.String(), secret) {
+			t.Errorf("control: the raw diff lacks %q, so this test proves nothing:\n%s", secret, rawText.String())
+		}
+	}
+}
+
+func TestProfileNamesAreAliased(t *testing.T) {
+	named := fixture.XL()
+	named.Name = "Personal Deck"
+	edited := fixture.XL()
+	edited.Name = "Personal Deck"
+	edited.Pages[0].Buttons[1].Title = "Paste"
+	extra := fixture.CopyOf(fixture.XL(), "extra")
+	extra.Name = "Hidden Profile"
+	fsAfter := fixture.Merge(edited.FS(), extra.FS())
+	b, err := Take(named.FS(), nil, "7.5.1", t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := Take(fsAfter, nil, "7.5.1", t0.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rep, err := Compare("names", b, a, redactor(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := rep.Markdown() + rep.EvidenceRow()
+	for _, name := range []string{"Personal Deck", "Hidden Profile"} {
+		if strings.Contains(out, name) {
+			t.Errorf("report carries profile name %q:\n%s", name, out)
+		}
+	}
+	if !strings.Contains(out, "| profile-1 |") || !strings.Contains(out, "added") {
+		t.Errorf("expected profile-N aliases and the added profile:\n%s", out)
+	}
+	// Known-bad control: the raw change set does carry the names.
+	raw, err := semdiff.Sets(b.Profiles, a.Profiles, semdiff.Raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rawText strings.Builder
+	for _, c := range raw {
+		rawText.WriteString(c.String() + "\n")
+	}
+	if !strings.Contains(rawText.String(), "Personal Deck") || !strings.Contains(rawText.String(), "Hidden Profile") {
+		t.Fatalf("control: the raw diff has no profile name:\n%s", rawText.String())
+	}
+}
+
+func TestLoadReturnsPrefsReadErrors(t *testing.T) {
+	s := take(t, fixture.XL(), nil, t0)
+	dir := filepath.Join(t.TempDir(), "snap")
+	if err := s.Save(dir); err != nil {
+		t.Fatal(err)
+	}
+	// Absent prefs.json is fine...
+	if _, err := Load(dir); err != nil {
+		t.Fatalf("Load without prefs: %v", err)
+	}
+	// ...but a prefs.json that exists and cannot be read is an error.
+	if err := os.Mkdir(filepath.Join(dir, "prefs.json"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(dir); err == nil {
+		t.Fatal("Load swallowed a prefs.json read error")
+	}
+}
+
+func TestFailedSaveRemovesItsDirectory(t *testing.T) {
+	s := take(t, fixture.XL(), prefs(t, "x"), t0)
+	dir := filepath.Join(t.TempDir(), "snap")
+	real := writeFile
+	calls := 0
+	writeFile = func(path string, data []byte) error {
+		calls++
+		if calls == 3 {
+			return errors.New("disk full")
+		}
+		return real(path, data)
+	}
+	t.Cleanup(func() { writeFile = real })
+	if err := s.Save(dir); err == nil {
+		t.Fatal("Save ignored the write failure")
+	}
+	if _, err := os.Lstat(dir); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("failed Save left %s behind: %v", dir, err)
+	}
+	writeFile = real
+	if err := s.Save(dir); err != nil {
+		t.Fatalf("retry after a failed Save: %v", err)
+	}
+}

@@ -121,9 +121,12 @@ func writeNew(path string, data []byte) error {
 	return f.Close()
 }
 
+// writeFile is writeNew; a test replaces it to fail a Save part-way.
+var writeFile = writeNew
+
 // Save writes the snapshot to dir, which must not exist yet. Every file is
 // created exclusively, so nothing existing is ever overwritten.
-func (s *Snapshot) Save(dir string) error {
+func (s *Snapshot) Save(dir string) (err error) {
 	if err := os.MkdirAll(filepath.Dir(dir), 0o700); err != nil {
 		return err
 	}
@@ -133,6 +136,12 @@ func (s *Snapshot) Save(dir string) error {
 		}
 		return err
 	}
+	// This call made dir (Mkdir is exclusive), so a failure removes it again.
+	defer func() {
+		if err != nil {
+			os.RemoveAll(dir)
+		}
+	}()
 	if err := os.Mkdir(filepath.Join(dir, "profiles"), 0o700); err != nil {
 		return err
 	}
@@ -142,13 +151,13 @@ func (s *Snapshot) Save(dir string) error {
 			if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
 				return err
 			}
-			if err := writeNew(target, data); err != nil {
+			if err := writeFile(target, data); err != nil {
 				return err
 			}
 		}
 	}
 	if s.Prefs != nil {
-		if err := writeNew(filepath.Join(dir, "prefs.json"), s.Prefs.Encode()); err != nil {
+		if err := writeFile(filepath.Join(dir, "prefs.json"), s.Prefs.Encode()); err != nil {
 			return err
 		}
 	}
@@ -156,7 +165,7 @@ func (s *Snapshot) Save(dir string) error {
 	if err != nil {
 		return err
 	}
-	return writeNew(filepath.Join(dir, "meta.json"), m)
+	return writeFile(filepath.Join(dir, "meta.json"), m)
 }
 
 // Load reads a snapshot written by Save.
@@ -170,10 +179,14 @@ func Load(dir string) (*Snapshot, error) {
 		return nil, err
 	}
 	var prefs *jsondoc.Value
-	if pb, err := os.ReadFile(filepath.Join(dir, "prefs.json")); err == nil {
+	pb, err := os.ReadFile(filepath.Join(dir, "prefs.json"))
+	switch {
+	case err == nil:
 		if prefs, err = jsondoc.Parse(pb); err != nil {
 			return nil, fmt.Errorf("prefs.json: %w", err)
 		}
+	case !errors.Is(err, fs.ErrNotExist):
+		return nil, fmt.Errorf("prefs.json: %w", err)
 	}
 	s, err := Take(os.DirFS(filepath.Join(dir, "profiles")), prefs, m.AppVersion, m.TakenAt)
 	if err != nil {
@@ -193,24 +206,88 @@ type Report struct {
 }
 
 // Compare diffs two snapshots (raw mode: runtime fields and ids included,
-// since that is what an observation is for) and redacts the result.
+// since that is what an observation is for) and redacts the result. Profile
+// names are user content, so the Profile column and added/removed profile
+// values carry the profile-N alias instead. A change whose path has any
+// secret-named member keeps no values at all (a bare scalar carries no name
+// for the redactor to judge), and so does one whose path cannot be parsed.
 func Compare(name string, before, after *Snapshot, r *redact.Redactor) (Report, error) {
-	changes, err := semdiff.Sets(before.Profiles, after.Profiles, semdiff.Raw)
-	if err != nil {
-		return Report{}, err
+	ps := newPseudonyms(before, after)
+	folders := map[string]bool{}
+	for f := range before.Profiles {
+		folders[f] = true
+	}
+	for f := range after.Profiles {
+		folders[f] = true
+	}
+	var sorted []string
+	for f := range folders {
+		sorted = append(sorted, f)
+	}
+	sort.Strings(sorted)
+	var changes []semdiff.Change
+	for _, folder := range sorted {
+		alias := ps.profileAlias(folder)
+		a, b := before.Profiles[folder], after.Profiles[folder]
+		switch {
+		case a == nil:
+			changes = append(changes, semdiff.Change{Profile: alias, Where: "profiles", Path: folder, Kind: semdiff.Added, After: alias})
+		case b == nil:
+			changes = append(changes, semdiff.Change{Profile: alias, Where: "profiles", Path: folder, Kind: semdiff.Removed, Before: alias})
+		default:
+			cs, err := semdiff.Profiles(a, b, semdiff.Raw)
+			if err != nil {
+				return Report{}, fmt.Errorf("%s: %w", folder, err)
+			}
+			for i := range cs {
+				cs[i].Profile = alias
+			}
+			changes = append(changes, cs...)
+		}
 	}
 	if before.Prefs != nil || after.Prefs != nil {
 		changes = append(changes, semdiff.Values("app preferences", "prefs", before.Prefs, after.Prefs)...)
 	}
-	ps := newPseudonyms(before, after)
 	for i := range changes {
 		c := &changes[i]
+		if blanksValues(c) {
+			c.Before, c.After = blank(c.Before), blank(c.After)
+		} else {
+			c.Before, c.After = redactJSON(r, c.Before), redactJSON(r, c.After)
+		}
 		c.Profile, c.Where, c.Path = r.String(c.Profile), r.String(c.Where), r.String(c.Path)
-		c.Before, c.After = redactJSON(r, c.Before), redactJSON(r, c.After)
 		c.Profile, c.Where, c.Path = ps.String(c.Profile), ps.String(c.Where), ps.String(c.Path)
 		c.Before, c.After = ps.String(c.Before), ps.String(c.After)
 	}
 	return Report{Name: name, Before: before.TakenAt, After: after.TakenAt, AppVersion: after.AppVersion, Changes: changes}, nil
+}
+
+// blank replaces a present value by redact.Redacted.
+func blank(s string) string {
+	if s == "" {
+		return s
+	}
+	return redact.Redacted
+}
+
+// blanksValues reports whether a change's values must not be shown: some
+// member on its path is secret-named, or the path is not parseable (fail
+// closed). File and whole-profile changes carry digests and names, not
+// member paths.
+func blanksValues(c *semdiff.Change) bool {
+	if c.Where == "files" || c.Where == "profiles" {
+		return false
+	}
+	segs, err := semdiff.ParsePath(c.Path)
+	if err != nil {
+		return true
+	}
+	for _, sg := range segs {
+		if !sg.IsIndex && redact.IsSecretName(sg.Name) {
+			return true
+		}
+	}
+	return false
 }
 
 // uuidPattern matches a UUID in any letter case.
@@ -276,6 +353,11 @@ func newPseudonyms(snaps ...*Snapshot) *pseudonyms {
 		}
 	}
 	return ps
+}
+
+// profileAlias is the profile-N name of a profile folder.
+func (ps *pseudonyms) profileAlias(folder string) string {
+	return ps.names[strings.ToLower(strings.TrimSuffix(folder, profile.Suffix))]
 }
 
 // String replaces every UUID in s.

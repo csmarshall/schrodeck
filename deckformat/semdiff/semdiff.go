@@ -122,6 +122,91 @@ func renderPathSegs(segments []seg) string {
 	return b.String()
 }
 
+// Segment is one step of a rendered path: a member name or an array index.
+type Segment struct {
+	Name    string // member name, empty if IsIndex
+	Index   int    // array index, valid only if IsIndex
+	IsIndex bool
+}
+
+// ParsePath inverts the rendering of Change.Path exactly, including the
+// quoted .["…"] member form and its escapes. A string the renderer could not
+// have produced is an error.
+func ParsePath(path string) ([]Segment, error) {
+	var segs []seg
+	i := 0
+	bad := func(why string) ([]Segment, error) {
+		return nil, fmt.Errorf("semdiff: path %q: %s at offset %d", path, why, i)
+	}
+	for i < len(path) {
+		if len(segs) > 0 && path[i] != '[' {
+			if path[i] != '.' {
+				return bad("expected '.' or '['")
+			}
+			i++
+			if i >= len(path) {
+				return bad("path ends after '.'")
+			}
+		}
+		if path[i] == '[' {
+			i++
+			if i < len(path) && path[i] == '"' {
+				i++
+				var name []byte
+				closed := false
+				for i < len(path) {
+					c := path[i]
+					if c == '\\' && i+1 < len(path) {
+						name = append(name, path[i+1])
+						i += 2
+						continue
+					}
+					if c == '"' {
+						closed = true
+						i++
+						break
+					}
+					name = append(name, c)
+					i++
+				}
+				if !closed || i >= len(path) || path[i] != ']' {
+					return bad("unterminated quoted member")
+				}
+				i++
+				segs = append(segs, seg{name: string(name)})
+				continue
+			}
+			start := i
+			for i < len(path) && path[i] >= '0' && path[i] <= '9' {
+				i++
+			}
+			if start == i || i >= len(path) || path[i] != ']' {
+				return bad("malformed array index")
+			}
+			n, err := strconv.Atoi(path[start:i])
+			if err != nil {
+				return bad("array index out of range")
+			}
+			i++
+			segs = append(segs, seg{idx: n, isIdx: true})
+			continue
+		}
+		start := i
+		for i < len(path) && path[i] != '.' && path[i] != '[' {
+			i++
+		}
+		segs = append(segs, seg{name: path[start:i]})
+	}
+	if renderPathSegs(segs) != path {
+		return nil, fmt.Errorf("semdiff: path %q is not in canonical rendered form", path)
+	}
+	out := make([]Segment, len(segs))
+	for k, sg := range segs {
+		out[k] = Segment{Name: sg.name, Index: sg.idx, IsIndex: sg.isIdx}
+	}
+	return out, nil
+}
+
 // Values compares two JSON trees and returns one change per differing leaf.
 // where and profileName label every change.
 func Values(profileName, where string, a, b *jsondoc.Value) []Change {
