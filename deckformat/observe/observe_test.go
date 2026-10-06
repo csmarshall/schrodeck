@@ -361,3 +361,35 @@ func TestFailedSaveRemovesItsDirectory(t *testing.T) {
 		t.Fatalf("retry after a failed Save: %v", err)
 	}
 }
+
+func TestProfileRenameIsAliased(t *testing.T) {
+	old := fixture.XL()
+	old.Name = "Old Secret Name"
+	renamed := fixture.XL()
+	renamed.Name = "New Secret Name"
+	b := take(t, old, nil, t0)
+	a := take(t, renamed, nil, t0.Add(time.Minute))
+	rep, err := Compare("rename", b, a, redactor(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := rep.Markdown() + rep.EvidenceRow()
+	if strings.Contains(out, "Secret Name") {
+		t.Errorf("report carries a profile name:\n%s", out)
+	}
+	if !strings.Contains(out, "profile-1 (renamed)") {
+		t.Errorf("rename is not visible as such:\n%s", out)
+	}
+	// Known-bad control: the raw diff does carry both names.
+	raw, err := semdiff.Sets(b.Profiles, a.Profiles, semdiff.Raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rawText strings.Builder
+	for _, c := range raw {
+		rawText.WriteString(c.String() + "\n")
+	}
+	if !strings.Contains(rawText.String(), "Old Secret Name") || !strings.Contains(rawText.String(), "New Secret Name") {
+		t.Fatalf("control: the raw diff has no names:\n%s", rawText.String())
+	}
+}

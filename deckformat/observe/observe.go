@@ -250,7 +250,10 @@ func Compare(name string, before, after *Snapshot, r *redact.Redactor) (Report, 
 	}
 	for i := range changes {
 		c := &changes[i]
-		if blanksValues(c) {
+		if c.Where == "profile" && c.Path == "Name" {
+			// The profile's own name is user content: both sides become its alias.
+			c.Before, c.After = renamed(c.Before, c.Profile), renamed(c.After, c.Profile)
+		} else if blanksValues(c) {
 			c.Before, c.After = blank(c.Before), blank(c.After)
 		} else {
 			c.Before, c.After = redactJSON(r, c.Before), redactJSON(r, c.After)
@@ -260,6 +263,14 @@ func Compare(name string, before, after *Snapshot, r *redact.Redactor) (Report, 
 		c.Before, c.After = ps.String(c.Before), ps.String(c.After)
 	}
 	return Report{Name: name, Before: before.TakenAt, After: after.TakenAt, AppVersion: after.AppVersion, Changes: changes}, nil
+}
+
+// renamed stands for a present profile name without showing it.
+func renamed(value, alias string) string {
+	if value == "" {
+		return value
+	}
+	return alias + " (renamed)"
 }
 
 // blank replaces a present value by redact.Redacted.
