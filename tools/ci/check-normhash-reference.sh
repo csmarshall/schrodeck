@@ -4,12 +4,13 @@
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #
 # Checks that the Go golden constants of deckformat/normhash are still what the independent Python reference (deckformat/normhash/testdata/refhash.py) computes for the same fixture on disk. For each golden fixture it writes the fixture with the TestWriteFixture* helper, runs the reference on it, and compares with the Go constant. Fails on any mismatch, on a reference that prints nothing or something that is not a sha256, and when a helper wrote no fixture (so a skipped helper cannot pass vacuously). Run from the repository root.
-# Usage: tools/ci/check-normhash-reference.sh   (REFHASH_PYTHON overrides the interpreter, default python3)
+# Usage: tools/ci/check-normhash-reference.sh   (REFHASH_PYTHON overrides the interpreter, default python3; NORMHASH_TEST_FILE and NORMHASH_REFERENCE override the inputs)
 unset TMOUT
 set -euo pipefail
 
-readonly TEST_FILE=deckformat/normhash/normhash_test.go
-readonly REFERENCE=deckformat/normhash/testdata/refhash.py
+# The two paths are overridable only so tools/ci/selftest.sh can feed it known-bad copies.
+readonly TEST_FILE=${NORMHASH_TEST_FILE:-deckformat/normhash/normhash_test.go}
+readonly REFERENCE=${NORMHASH_REFERENCE:-deckformat/normhash/testdata/refhash.py}
 readonly PYTHON=${REFHASH_PYTHON:-python3}
 # <TestWriteFixture helper> <Go constant it pins>
 readonly CASES=(
