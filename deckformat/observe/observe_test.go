@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"testing/fstest"
 	"time"
 	"unicode/utf8"
 
@@ -495,6 +496,89 @@ func TestRedactionAppliesInContext(t *testing.T) {
 			}
 			if !strings.Contains(out, redact.Redacted) {
 				t.Errorf("a changed secret must still leave a row showing %s:\n%s", redact.Redacted, out)
+			}
+		})
+	}
+}
+
+// TestSameSlotOnAnotherPageCannotUnblankASecret is the cross-page control: the
+// same path on two pages holds the same raw value, a secret on page 1 and a
+// plain setting on page 2. Only page 1 changes, so its Before side must be
+// resolved against page 1 alone. Map iteration order is random, so each case
+// runs many times; resolving against whichever page matched first printed the
+// secret in roughly one run in eight.
+func TestSameSlotOnAnotherPageCannotUnblankASecret(t *testing.T) {
+	const same = "SAMEVAL"
+	pairs := func(name, value string) string {
+		return `{"items":[{"name":"` + name + `","value":"` + value + `"}]}`
+	}
+	// atSlot puts the pairs in key 0,0's Settings on both pages.
+	atSlot := func(secretValue string) fstest.MapFS {
+		p := fixture.XL()
+		p.Pages[0].Buttons[0].Settings = pairs("token", secretValue)
+		p.Pages[1].Buttons = append(p.Pages[1].Buttons, fixture.Button{
+			Slot: "0,0", ActionID: "11111111-0000-4000-8000-000000000009", Plugin: "com.elgato.streamdeck.system.open",
+			Settings: pairs("color", same),
+		})
+		return p.FS()
+	}
+	// atPage puts the pairs at the top of both page manifests (no slot).
+	atPage := func(secretValue string) fstest.MapFS {
+		p := fixture.XL()
+		fsys := p.FS()
+		put := func(pageID, items string) {
+			f := fsys[p.Folder()+"/Profiles/"+fixture.PageFolder(pageID)+"/manifest.json"]
+			f.Data = []byte(strings.Replace(string(f.Data), `"Icon":""`, `"Icon":"","items":`+strings.TrimSuffix(strings.TrimPrefix(items, `{"items":`), `}`), 1))
+		}
+		put(p.Pages[0].ID, pairs("token", secretValue))
+		put(p.Pages[1].ID, pairs("color", same))
+		return fsys
+	}
+	for _, tc := range []struct {
+		name  string
+		build func(string) fstest.MapFS
+	}{{"key slot", atSlot}, {"page level", atPage}} {
+		t.Run(tc.name, func(t *testing.T) {
+			snap := func(fsys fstest.MapFS, at time.Time) *Snapshot {
+				s, err := Take(fsys, nil, "7.5.1", at)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return s
+			}
+			before, after := snap(tc.build(same), t0), snap(tc.build("CHANGED"), t0.Add(time.Minute))
+			// Known-bad control: the raw diff does carry the secret.
+			raw, err := semdiff.Sets(before.Profiles, after.Profiles, semdiff.Raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var rawText strings.Builder
+			for _, c := range raw {
+				rawText.WriteString(c.String() + "\n")
+			}
+			if !strings.Contains(rawText.String(), same) || !strings.Contains(rawText.String(), "CHANGED") {
+				t.Fatalf("control: the raw diff lacks the secret:\n%s", rawText.String())
+			}
+			leaks := 0
+			const runs = 300
+			for i := 0; i < runs; i++ {
+				rep, err := Compare("cross-page", before, after, redactor(t))
+				if err != nil {
+					t.Fatal(err)
+				}
+				out := rep.Markdown() + "\n" + rep.EvidenceRow()
+				if strings.Contains(out, same) || strings.Contains(out, "CHANGED") {
+					if leaks == 0 {
+						t.Errorf("report leaks the secret:\n%s", out)
+					}
+					leaks++
+				}
+				if !strings.Contains(out, redact.Redacted) {
+					t.Fatalf("the changed secret must leave a %s row:\n%s", redact.Redacted, out)
+				}
+			}
+			if leaks > 0 {
+				t.Errorf("secret leaked in %d of %d runs", leaks, runs)
 			}
 		})
 	}

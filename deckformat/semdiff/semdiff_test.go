@@ -298,3 +298,38 @@ func TestParsePathInvertsRendering(t *testing.T) {
 		}
 	}
 }
+
+// TestPageChangesNameTheirPageAndSlot checks the routing fields a caller needs
+// to resolve a page change against exactly one page manifest.
+func TestPageChangesNameTheirPageAndSlot(t *testing.T) {
+	before := fixture.XL()
+	after := fixture.XL()
+	after.Pages[1].Buttons[0].Settings = `{"x":1}`
+	for _, tc := range []struct {
+		mode Mode
+		page string
+	}{{Raw, after.Pages[1].ID}, {Semantic, "page/1"}} {
+		cs, err := Profiles(loadP(t, before), loadP(t, after), tc.mode)
+		if err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		for _, c := range cs {
+			if c.Path != "Settings.x" {
+				continue
+			}
+			found = true
+			if c.Page != tc.page || c.SlotPath != "Controllers[0].Actions.7,3" {
+				t.Errorf("mode %d: Page %q SlotPath %q, want %q and Controllers[0].Actions.7,3", tc.mode, c.Page, c.SlotPath, tc.page)
+			}
+		}
+		if !found {
+			t.Fatalf("mode %d: no Settings.x change in\n%s", tc.mode, render(cs))
+		}
+		for _, c := range cs {
+			if (c.Where == "profile" || c.Where == "files") && (c.Page != "" || c.SlotPath != "") {
+				t.Errorf("mode %d: non-page change carries page routing: %+v", tc.mode, c)
+			}
+		}
+	}
+}

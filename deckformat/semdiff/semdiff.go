@@ -59,6 +59,15 @@ type Change struct {
 	Kind    Kind   `json:"kind"`
 	Before  string `json:"before,omitempty"`
 	After   string `json:"after,omitempty"`
+	// Page identifies the page a page change was found in: its Profile.Pages
+	// key in raw mode, its canonical label ("page/0", "default", ...) in
+	// semantic mode. Empty for changes outside pages. Not serialized: it is
+	// a routing key for tools that resolve Path back into the documents.
+	Page string `json:"-"`
+	// SlotPath is the rendered path, inside that page's manifest, of the
+	// action slot Path is relative to (e.g. "Controllers[0].Actions.0,0").
+	// Empty when Path is relative to the page manifest itself.
+	SlotPath string `json:"-"`
 }
 
 // String renders a change on one line.
@@ -312,7 +321,7 @@ func humanPage(label string) string {
 // pageChanges compares two page manifests and moves the key slot out of the
 // path into Where: "page 1 › key 3,1" + "Settings.path".
 // It works on the structured path representation to avoid re-splitting collisions.
-func pageChanges(profileName, page string, a, b *jsondoc.Value, equal scalarEqual) []Change {
+func pageChanges(profileName, page, pageID string, a, b *jsondoc.Value, equal scalarEqual) []Change {
 	var out []Change
 
 	// Walk through differences and rebuild paths from segments
@@ -347,10 +356,12 @@ func pageChanges(profileName, page string, a, b *jsondoc.Value, equal scalarEqua
 				}
 
 				c := Change{
-					Profile: profileName,
-					Where:   page + " › " + control + " " + slot,
-					Path:    renderPathSegs(tail),
-					Kind:    kind,
+					Profile:  profileName,
+					Where:    page + " › " + control + " " + slot,
+					Path:     renderPathSegs(tail),
+					Kind:     kind,
+					Page:     pageID,
+					SlotPath: renderPathSegs(path[:4]),
 				}
 				if x != nil {
 					c.Before = string(x.Encode())
@@ -369,6 +380,7 @@ func pageChanges(profileName, page string, a, b *jsondoc.Value, equal scalarEqua
 			Where:   page,
 			Path:    renderPathSegs(path),
 			Kind:    kind,
+			Page:    pageID,
 		}
 		if x != nil {
 			c.Before = string(x.Encode())
@@ -436,7 +448,7 @@ func docChanges(name string, a, b map[string]*jsondoc.Value) []Change {
 			continue
 		}
 		label := strings.TrimSuffix(path, "/manifest.json")
-		out = append(out, pageChanges(name, humanPage(label), a[path], b[path], canonicalEqual)...)
+		out = append(out, pageChanges(name, humanPage(label), label, a[path], b[path], canonicalEqual)...)
 	}
 	return out
 }
@@ -480,7 +492,7 @@ func rawChanges(name string, before, after *profile.Profile) ([]Change, error) {
 		if pg := after.Pages[k]; pg != nil {
 			b = pg.Manifest
 		}
-		out = append(out, pageChanges(name, humanPage(label)+" ("+k+")", a, b, rawEqual)...)
+		out = append(out, pageChanges(name, humanPage(label)+" ("+k+")", k, a, b, rawEqual)...)
 	}
 	out = append(out, fileChanges(name, before.Files(), after.Files())...)
 	return out, nil

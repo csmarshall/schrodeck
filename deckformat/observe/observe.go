@@ -104,6 +104,16 @@ func Settle(take func() (*Snapshot, error), wait func(), maxTries int) (*Snapsho
 	return nil, fmt.Errorf("observe: the app's files kept changing across %d snapshots", maxTries)
 }
 
+// sortedKeys returns m's keys in order, so walks over maps are deterministic.
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
 // ErrExists means a snapshot directory is already in use.
 var ErrExists = errors.New("observe: snapshot directory already exists")
 
@@ -145,8 +155,10 @@ func (s *Snapshot) Save(dir string) (err error) {
 	if err := os.Mkdir(filepath.Join(dir, "profiles"), 0o700); err != nil {
 		return err
 	}
-	for folder, p := range s.Profiles {
-		for rel, data := range p.Files() {
+	for _, folder := range sortedKeys(s.Profiles) {
+		files := s.Profiles[folder].Files()
+		for _, rel := range sortedKeys(files) {
+			data := files[rel]
 			target := filepath.Join(dir, "profiles", folder, filepath.FromSlash(rel))
 			if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
 				return err
@@ -268,6 +280,8 @@ func Compare(name string, before, after *Snapshot, r *redact.Redactor) (Report, 
 		c.Profile, c.Where, c.Path = r.String(c.Profile), r.String(c.Where), r.String(c.Path)
 		c.Profile, c.Where, c.Path = ps.String(c.Profile), ps.String(c.Where), ps.String(c.Path)
 		c.Before, c.After = ps.String(c.Before), ps.String(c.After)
+		// Page and SlotPath carry raw page ids and served only to resolve the change.
+		c.Page, c.SlotPath = "", ""
 	}
 	return Report{Name: name, Before: before.TakenAt, After: after.TakenAt, AppVersion: after.AppVersion, Changes: changes}, nil
 }
@@ -456,8 +470,8 @@ func (rd *renderer) render(folder string, c *semdiff.Change) {
 		c.Before, c.After = blankSide(c.Before), blankSide(c.After)
 		return
 	}
-	c.Before = rd.side(rd.before, folder, c.Where, segs, c.Before)
-	c.After = rd.side(rd.after, folder, c.Where, segs, c.After)
+	c.Before = rd.side(rd.before, folder, c, segs, c.Before)
+	c.After = rd.side(rd.after, folder, c, segs, c.After)
 }
 
 func blankSide(s string) string {
@@ -467,29 +481,35 @@ func blankSide(s string) string {
 	return redact.Redacted
 }
 
-// side finds the node at segs in snapshot s whose raw encoding is raw and
-// returns the encoding of the same node in the redacted copy. Page changes
-// carry their path relative to the key slot named in Where, so every page's
-// slot is a candidate; matching on the raw encoding picks the right one.
-func (rd *renderer) side(s *Snapshot, folder, where string, segs []semdiff.Segment, raw string) string {
+// side finds the node at segs in snapshot s and returns the encoding of the
+// same node in the redacted copy. The change names exactly one document (the
+// prefs, the profile manifest, or one page manifest via Change.Page, narrowed
+// to an action slot via Change.SlotPath), so a value is never resolved in the
+// context of another page. A side whose node is missing, whose raw encoding
+// differs from the change's, or that resolves to more than one root is blanked
+// (fail closed).
+func (rd *renderer) side(s *Snapshot, folder string, c *semdiff.Change, segs []semdiff.Segment, raw string) string {
 	if raw == "" {
 		return ""
 	}
-	for _, root := range rd.roots(s, folder, where) {
-		rawNode, redNode := walkPair(root.raw, root.red, segs)
-		if rawNode != nil && string(rawNode.Encode()) == raw {
-			return string(redNode.Encode())
-		}
+	roots := rd.roots(s, folder, c)
+	if len(roots) != 1 {
+		return redact.Redacted
 	}
-	return redact.Redacted
+	rawNode, redNode := walkPair(roots[0].raw, roots[0].red, segs)
+	if rawNode == nil || string(rawNode.Encode()) != raw {
+		return redact.Redacted
+	}
+	return string(redNode.Encode())
 }
 
 type rootPair struct{ raw, red *jsondoc.Value }
 
-// roots lists the documents (raw and redacted) a change's path may be relative to.
-func (rd *renderer) roots(s *Snapshot, folder, where string) []rootPair {
+// roots lists the documents (raw and redacted) a change's path is relative to:
+// exactly one when the change can be resolved, none otherwise.
+func (rd *renderer) roots(s *Snapshot, folder string, c *semdiff.Change) []rootPair {
 	pair := func(v *jsondoc.Value) rootPair { return rootPair{v, rd.redacted(v)} }
-	switch where {
+	switch c.Where {
 	case "prefs":
 		if s.Prefs != nil {
 			return []rootPair{pair(s.Prefs)}
@@ -502,30 +522,26 @@ func (rd *renderer) roots(s *Snapshot, folder, where string) []rootPair {
 		return nil
 	}
 	p := s.Profiles[folder]
-	if p == nil {
+	if p == nil || c.Page == "" {
 		return nil
 	}
-	slot := ""
-	if _, rest, ok := strings.Cut(where, " › "); ok {
-		if fields := strings.Fields(rest); len(fields) == 2 {
-			slot = fields[1]
-		}
+	pg := p.Pages[c.Page]
+	if pg == nil || pg.Manifest == nil {
+		return nil
 	}
-	var roots []rootPair
-	for _, pg := range p.Pages {
-		page := pair(pg.Manifest)
-		if slot == "" {
-			roots = append(roots, page)
-			continue
-		}
-		for i := range pg.Manifest.Get("Controllers").Items() {
-			prefix := []semdiff.Segment{{Name: "Controllers"}, {Index: i, IsIndex: true}, {Name: "Actions"}, {Name: slot}}
-			if raw, red := walkPair(page.raw, page.red, prefix); raw != nil {
-				roots = append(roots, rootPair{raw, red})
-			}
-		}
+	page := pair(pg.Manifest)
+	if c.SlotPath == "" {
+		return []rootPair{page}
 	}
-	return roots
+	prefix, err := semdiff.ParsePath(c.SlotPath)
+	if err != nil {
+		return nil
+	}
+	raw, red := walkPair(page.raw, page.red, prefix)
+	if raw == nil {
+		return nil
+	}
+	return []rootPair{{raw, red}}
 }
 
 // walkPair follows segs through a raw document and its redacted copy in step,
