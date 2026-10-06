@@ -111,10 +111,14 @@ func classify(parts []string, isDir bool) entryKind {
 // or a manifest that does not round-trip (jsondoc.ErrNotRoundTrip).
 func Load(fsys fs.FS, folder string) (*Profile, error) {
 	p := &Profile{Folder: folder, Images: map[string][]byte{}, Pages: map[string]*Page{}}
+	var caseConflict error
 	page := func(name string) *Page {
 		key := strings.ToLower(name)
 		if p.Pages[key] == nil {
 			p.Pages[key] = &Page{Folder: name, Images: map[string][]byte{}}
+		} else if p.Pages[key].Folder != name {
+			// Detect case-sensitive conflict: same key, different folder name
+			caseConflict = fmt.Errorf("%s: page folders %q and %q differ only in case", folder, p.Pages[key].Folder, name)
 		}
 		return p.Pages[key]
 	}
@@ -155,11 +159,17 @@ func Load(fsys fs.FS, folder string) (*Profile, error) {
 				p.Manifest = doc
 			} else {
 				page(parts[1]).Manifest = doc
+				if caseConflict != nil {
+					return caseConflict
+				}
 			}
 		case topImage:
 			p.Images[parts[1]] = data
 		case pageImage:
 			page(parts[1]).Images[parts[3]] = data
+			if caseConflict != nil {
+				return caseConflict
+			}
 		}
 		return nil
 	})

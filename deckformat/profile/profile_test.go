@@ -106,6 +106,12 @@ func TestAllowList(t *testing.T) {
 		"Images/.DS_Store":          false,
 		"manifest.json (conflicted copy 2026-10-02).json": false,
 		"Images/x.png.icloud":                             false,
+		"Images/x.png~":                                   false,
+		".manifest.json.swp":                              false,
+		"#manifest.json#":                                 false,
+		"~$x.png":                                         false,
+		"notes.swp":                                       true,
+		"#x":                                              true,
 	}
 	for extra, mustFail := range cases {
 		fp := fixture.XL()
@@ -127,6 +133,41 @@ func TestJunkIsRecorded(t *testing.T) {
 	}
 	if _, ok := p.Files()[".DS_Store"]; ok {
 		t.Fatal("junk must not be part of the profile's files")
+	}
+}
+
+func TestJunkPatternsRecorded(t *testing.T) {
+	cases := []string{
+		"Images/x.png~",
+		".manifest.json.swp",
+		"#manifest.json#",
+		"~$x.png",
+	}
+	for _, junk := range cases {
+		fp := fixture.XL()
+		fp.Extra = map[string][]byte{junk: []byte("x")}
+		p := load(t, fp)
+		if len(p.Junk) != 1 || p.Junk[0] != junk {
+			t.Errorf("%s: Junk = %v, want [%q]", junk, p.Junk, junk)
+		}
+		if _, ok := p.Files()[junk]; ok {
+			t.Errorf("%s: junk must not be part of the profile's files", junk)
+		}
+	}
+}
+
+func TestCaseSensitivePageFolders(t *testing.T) {
+	fp := fixture.XL()
+	fsys := fp.FS()
+	// Add conflicting page folders that differ only in case
+	fsys[fp.Folder()+"/Profiles/ABC/manifest.json"] = &fstest.MapFile{Data: []byte(`{"Controllers":[{"Type":"Keypad"}],"Icon":"","Name":""}`)}
+	fsys[fp.Folder()+"/Profiles/abc/manifest.json"] = &fstest.MapFile{Data: []byte(`{"Controllers":[{"Type":"Keypad"}],"Icon":"","Name":""}`)}
+	_, err := Load(fsys, fp.Folder())
+	if err == nil {
+		t.Fatal("loading with conflicting page folder case must error")
+	}
+	if !strings.Contains(err.Error(), "ABC") || !strings.Contains(err.Error(), "abc") {
+		t.Fatalf("error must name both conflicting folders: %v", err)
 	}
 }
 
