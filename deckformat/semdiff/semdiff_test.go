@@ -261,3 +261,128 @@ func TestSemanticIgnoresSpellingTheHashIgnores(t *testing.T) {
 		})
 	}
 }
+
+func TestParsePathInvertsRendering(t *testing.T) {
+	cases := [][]seg{
+		{{name: "a"}, {name: "b"}},
+		{{name: "x"}, {name: "[0]"}},
+		{{name: "a"}, {idx: 0, isIdx: true}},
+		{{name: "a[0]"}},
+		{{name: "a.b"}},
+		{{name: "x"}, {name: `a"b\c`}},
+		{{name: ""}, {name: "k"}},
+		{{name: "a"}, {idx: 12, isIdx: true}, {idx: 3, isIdx: true}, {name: "z"}},
+		{{idx: 1, isIdx: true}, {name: "q"}},
+		{{name: `\`}},
+	}
+	for _, segs := range cases {
+		path := renderPathSegs(segs)
+		got, err := ParsePath(path)
+		if err != nil {
+			t.Errorf("ParsePath(%q): %v", path, err)
+			continue
+		}
+		if len(got) != len(segs) {
+			t.Errorf("ParsePath(%q) = %v", path, got)
+			continue
+		}
+		for i := range segs {
+			if got[i] != (Segment{Name: segs[i].name, Index: segs[i].idx, IsIndex: segs[i].isIdx}) {
+				t.Errorf("ParsePath(%q)[%d] = %+v, want %+v", path, i, got[i], segs[i])
+			}
+		}
+	}
+	for _, bad := range []string{"a.", "a..b", `["x`, `["x"`, "[x]", "[]", "a[1", "a b.", `a["x"]`, "[99999999999999999999]"} {
+		if _, err := ParsePath(bad); err == nil {
+			t.Errorf("ParsePath(%q) accepted a string the renderer never produces", bad)
+		}
+	}
+}
+
+// TestPageChangesNameTheirPageAndSlot checks the routing fields a caller needs
+// to resolve a page change against exactly one page manifest.
+func TestPageChangesNameTheirPageAndSlot(t *testing.T) {
+	before := fixture.XL()
+	after := fixture.XL()
+	after.Pages[1].Buttons[0].Settings = `{"x":1}`
+	for _, tc := range []struct {
+		mode Mode
+		page string
+	}{{Raw, after.Pages[1].ID}, {Semantic, "page/1"}} {
+		cs, err := Profiles(loadP(t, before), loadP(t, after), tc.mode)
+		if err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		for _, c := range cs {
+			if c.Path != "Settings.x" {
+				continue
+			}
+			found = true
+			if c.Page != tc.page || c.SlotPath != "Controllers[0].Actions.7,3" {
+				t.Errorf("mode %d: Page %q SlotPath %q, want %q and Controllers[0].Actions.7,3", tc.mode, c.Page, c.SlotPath, tc.page)
+			}
+		}
+		if !found {
+			t.Fatalf("mode %d: no Settings.x change in\n%s", tc.mode, render(cs))
+		}
+		for _, c := range cs {
+			if (c.Where == "profile" || c.Where == "files") && (c.Page != "" || c.SlotPath != "") {
+				t.Errorf("mode %d: non-page change carries page routing: %+v", tc.mode, c)
+			}
+		}
+	}
+}
+
+func TestLeavesExpandAddedAndRemovedSubtrees(t *testing.T) {
+	a := mustParse(t, `{"keep":1}`)
+	b := mustParse(t, `{"keep":1,"new":{"x":[1,{"y":true}],"empty":{},"none":[]}}`)
+	got := render(ValueLeaves("p", "w", a, b))
+	want := strings.Join([]string{
+		"p: w › new.x[0] added: 1",
+		"p: w › new.x[1].y added: true",
+		"p: w › new.empty added: {}",
+		"p: w › new.none added: []",
+	}, "\n")
+	if got != want {
+		t.Fatalf("ValueLeaves added:\n%s\nwant:\n%s", got, want)
+	}
+	if got := render(ValueLeaves("p", "w", b, a)); got != strings.ReplaceAll(strings.ReplaceAll(want, " added: ", " removed (was "), "\n", ")\n")+")" {
+		t.Fatalf("ValueLeaves removed:\n%s", got)
+	}
+	// Known-bad control: Values keeps the subtree in one change.
+	if got := render(Values("p", "w", a, b)); strings.Count(got, "\n") != 0 || !strings.Contains(got, `"x":[1,{"y":true}]`) {
+		t.Fatalf("Values no longer reports the subtree whole:\n%s", got)
+	}
+}
+
+func TestProfileLeavesKeepPagesAndSlots(t *testing.T) {
+	before, after := fixture.XL(), fixture.XL()
+	after.Pages[0].Buttons = append(after.Pages[0].Buttons, fixture.Button{Slot: "2,0", ActionID: "22222222-0000-4000-8000-000000000001", Plugin: "com.elgato.streamdeck.multiactions",
+		Settings: `{"Actions":[{"ActionID":"33333333-0000-4000-8000-000000000001"}]}`})
+	cs, err := ProfileLeaves(loadP(t, before), loadP(t, after), Raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, c := range cs {
+		if c.Kind != Added || !strings.HasSuffix(c.Where, "key 2,0") || c.SlotPath != "Controllers[0].Actions.2,0" || c.Page == "" {
+			t.Errorf("leaf of the new key is not placed in its slot: %+v", c)
+		}
+		if c.Path == "Settings.Actions[0].ActionID" && c.After == `"33333333-0000-4000-8000-000000000001"` {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("the child ActionID is not its own leaf:\n%s", render(cs))
+	}
+}
+
+func mustParse(t *testing.T, s string) *jsondoc.Value {
+	t.Helper()
+	v, err := jsondoc.Parse([]byte(s))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return v
+}

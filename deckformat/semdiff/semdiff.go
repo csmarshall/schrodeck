@@ -59,6 +59,15 @@ type Change struct {
 	Kind    Kind   `json:"kind"`
 	Before  string `json:"before,omitempty"`
 	After   string `json:"after,omitempty"`
+	// Page identifies the page a page change was found in: its Profile.Pages
+	// key in raw mode, its canonical label ("page/0", "default", ...) in
+	// semantic mode. Empty for changes outside pages. Not serialized: it is
+	// a routing key for tools that resolve Path back into the documents.
+	Page string `json:"-"`
+	// SlotPath is the rendered path, inside that page's manifest, of the
+	// action slot Path is relative to (e.g. "Controllers[0].Actions.0,0").
+	// Empty when Path is relative to the page manifest itself.
+	SlotPath string `json:"-"`
 }
 
 // String renders a change on one line.
@@ -122,10 +131,122 @@ func renderPathSegs(segments []seg) string {
 	return b.String()
 }
 
+// Segment is one step of a rendered path: a member name or an array index.
+type Segment struct {
+	Name    string // member name, empty if IsIndex
+	Index   int    // array index, valid only if IsIndex
+	IsIndex bool
+}
+
+// ParsePath inverts the rendering of Change.Path exactly, including the
+// quoted .["…"] member form and its escapes. A string the renderer could not
+// have produced is an error.
+func ParsePath(path string) ([]Segment, error) {
+	var segs []seg
+	i := 0
+	bad := func(why string) ([]Segment, error) {
+		return nil, fmt.Errorf("semdiff: path %q: %s at offset %d", path, why, i)
+	}
+	for i < len(path) {
+		if len(segs) > 0 && path[i] != '[' {
+			if path[i] != '.' {
+				return bad("expected '.' or '['")
+			}
+			i++
+			if i >= len(path) {
+				return bad("path ends after '.'")
+			}
+		}
+		if path[i] == '[' {
+			i++
+			if i < len(path) && path[i] == '"' {
+				i++
+				var name []byte
+				closed := false
+				for i < len(path) {
+					c := path[i]
+					if c == '\\' && i+1 < len(path) {
+						name = append(name, path[i+1])
+						i += 2
+						continue
+					}
+					if c == '"' {
+						closed = true
+						i++
+						break
+					}
+					name = append(name, c)
+					i++
+				}
+				if !closed || i >= len(path) || path[i] != ']' {
+					return bad("unterminated quoted member")
+				}
+				i++
+				segs = append(segs, seg{name: string(name)})
+				continue
+			}
+			start := i
+			for i < len(path) && path[i] >= '0' && path[i] <= '9' {
+				i++
+			}
+			if start == i || i >= len(path) || path[i] != ']' {
+				return bad("malformed array index")
+			}
+			n, err := strconv.Atoi(path[start:i])
+			if err != nil {
+				return bad("array index out of range")
+			}
+			i++
+			segs = append(segs, seg{idx: n, isIdx: true})
+			continue
+		}
+		start := i
+		for i < len(path) && path[i] != '.' && path[i] != '[' {
+			i++
+		}
+		segs = append(segs, seg{name: path[start:i]})
+	}
+	if renderPathSegs(segs) != path {
+		return nil, fmt.Errorf("semdiff: path %q is not in canonical rendered form", path)
+	}
+	out := make([]Segment, len(segs))
+	for k, sg := range segs {
+		out[k] = Segment{Name: sg.name, Index: sg.idx, IsIndex: sg.isIdx}
+	}
+	return out, nil
+}
+
 // Values compares two JSON trees and returns one change per differing leaf.
-// where and profileName label every change.
+// where and profileName label every change. An object or array that is added
+// or removed as a whole is one change carrying the whole subtree.
 func Values(profileName, where string, a, b *jsondoc.Value) []Change {
-	return values(profileName, where, a, b, rawEqual)
+	return values(profileName, where, a, b, comparer{equal: rawEqual})
+}
+
+// ValueLeaves is Values, except that an added or removed object or array is
+// reported as one change per leaf, each with its own path (an empty object or
+// array is itself a leaf). Tools that render or redact one scalar at a time,
+// such as observation reports, need every change to name a single leaf.
+func ValueLeaves(profileName, where string, a, b *jsondoc.Value) []Change {
+	return values(profileName, where, a, b, comparer{equal: rawEqual, leaves: true})
+}
+
+// comparer is how two trees are compared: when scalars are equal, and whether
+// a wholly added or removed subtree is reported leaf by leaf.
+type comparer struct {
+	equal  scalarEqual
+	leaves bool
+}
+
+// expands reports whether v is a subtree cmp reports leaf by leaf.
+func (cmp comparer) expands(v *jsondoc.Value) bool {
+	switch v.Kind() {
+	case jsondoc.Object:
+		return cmp.leaves && len(v.Members()) > 0
+	case jsondoc.Array:
+		return cmp.leaves && len(v.Items()) > 0
+	}
+	return false
 }
 
 // scalarEqual decides whether two scalars of the same kind are the same value.
@@ -147,7 +268,7 @@ func canonicalEqual(a, b *jsondoc.Value) bool {
 	return bytes.Equal(ca, cb)
 }
 
-func values(profileName, where string, a, b *jsondoc.Value, equal scalarEqual) []Change {
+func values(profileName, where string, a, b *jsondoc.Value, cmp comparer) []Change {
 	var out []Change
 	emit := func(path []seg, kind Kind, x, y *jsondoc.Value) {
 		c := Change{Profile: profileName, Where: where, Path: renderPathSegs(path), Kind: kind}
@@ -159,13 +280,19 @@ func values(profileName, where string, a, b *jsondoc.Value, equal scalarEqual) [
 		}
 		out = append(out, c)
 	}
-	diffValues(nil, a, b, emit, equal)
+	diffValues(nil, a, b, emit, cmp)
 	return out
 }
 
-func diffValues(path []seg, a, b *jsondoc.Value, emit func([]seg, Kind, *jsondoc.Value, *jsondoc.Value), equal scalarEqual) {
+func diffValues(path []seg, a, b *jsondoc.Value, emit func([]seg, Kind, *jsondoc.Value, *jsondoc.Value), cmp comparer) {
 	switch {
 	case a == nil && b == nil:
+		return
+	case a == nil && cmp.expands(b):
+		eachChild(path, b, func(p []seg, v *jsondoc.Value) { diffValues(p, nil, v, emit, cmp) })
+		return
+	case b == nil && cmp.expands(a):
+		eachChild(path, a, func(p []seg, v *jsondoc.Value) { diffValues(p, v, nil, emit, cmp) })
 		return
 	case a == nil:
 		emit(path, Added, nil, b)
@@ -182,11 +309,11 @@ func diffValues(path []seg, a, b *jsondoc.Value, emit func([]seg, Kind, *jsondoc
 		seen := map[string]bool{}
 		for _, m := range a.Members() {
 			seen[m.Name] = true
-			diffValues(append(path[:len(path):len(path)], seg{name: m.Name}), m.Value, b.Get(m.Name), emit, equal)
+			diffValues(append(path[:len(path):len(path)], seg{name: m.Name}), m.Value, b.Get(m.Name), emit, cmp)
 		}
 		for _, m := range b.Members() {
 			if !seen[m.Name] {
-				emit(append(path[:len(path):len(path)], seg{name: m.Name}), Added, nil, m.Value)
+				diffValues(append(path[:len(path):len(path)], seg{name: m.Name}), nil, m.Value, emit, cmp)
 			}
 		}
 	case jsondoc.Array:
@@ -199,12 +326,22 @@ func diffValues(path []seg, a, b *jsondoc.Value, emit func([]seg, Kind, *jsondoc
 			if i < len(bi) {
 				y = bi[i]
 			}
-			diffValues(append(path[:len(path):len(path)], seg{idx: i, isIdx: true}), x, y, emit, equal)
+			diffValues(append(path[:len(path):len(path)], seg{idx: i, isIdx: true}), x, y, emit, cmp)
 		}
 	default:
-		if !equal(a, b) {
+		if !cmp.equal(a, b) {
 			emit(path, Modified, a, b)
 		}
+	}
+}
+
+// eachChild calls fn with the path and value of every member or item of v.
+func eachChild(path []seg, v *jsondoc.Value, fn func([]seg, *jsondoc.Value)) {
+	for _, m := range v.Members() {
+		fn(append(path[:len(path):len(path)], seg{name: m.Name}), m.Value)
+	}
+	for i, it := range v.Items() {
+		fn(append(path[:len(path):len(path)], seg{idx: i, isIdx: true}), it)
 	}
 }
 
@@ -227,7 +364,7 @@ func humanPage(label string) string {
 // pageChanges compares two page manifests and moves the key slot out of the
 // path into Where: "page 1 › key 3,1" + "Settings.path".
 // It works on the structured path representation to avoid re-splitting collisions.
-func pageChanges(profileName, page string, a, b *jsondoc.Value, equal scalarEqual) []Change {
+func pageChanges(profileName, page, pageID string, a, b *jsondoc.Value, cmp comparer) []Change {
 	var out []Change
 
 	// Walk through differences and rebuild paths from segments
@@ -262,10 +399,12 @@ func pageChanges(profileName, page string, a, b *jsondoc.Value, equal scalarEqua
 				}
 
 				c := Change{
-					Profile: profileName,
-					Where:   page + " › " + control + " " + slot,
-					Path:    renderPathSegs(tail),
-					Kind:    kind,
+					Profile:  profileName,
+					Where:    page + " › " + control + " " + slot,
+					Path:     renderPathSegs(tail),
+					Kind:     kind,
+					Page:     pageID,
+					SlotPath: renderPathSegs(path[:4]),
 				}
 				if x != nil {
 					c.Before = string(x.Encode())
@@ -284,6 +423,7 @@ func pageChanges(profileName, page string, a, b *jsondoc.Value, equal scalarEqua
 			Where:   page,
 			Path:    renderPathSegs(path),
 			Kind:    kind,
+			Page:    pageID,
 		}
 		if x != nil {
 			c.Before = string(x.Encode())
@@ -294,7 +434,7 @@ func pageChanges(profileName, page string, a, b *jsondoc.Value, equal scalarEqua
 		out = append(out, c)
 	}
 
-	diffValues(nil, a, b, emit, equal)
+	diffValues(nil, a, b, emit, cmp)
 	return out
 }
 
@@ -320,6 +460,17 @@ func displayName(p *profile.Profile) string {
 
 // Profiles compares two versions of one profile.
 func Profiles(before, after *profile.Profile, mode Mode) ([]Change, error) {
+	return profiles(before, after, mode, false)
+}
+
+// ProfileLeaves is Profiles with the per-leaf reporting of ValueLeaves: an
+// added or removed object or array (a new key, a new page) is one change per
+// leaf, still placed in its page and key slot.
+func ProfileLeaves(before, after *profile.Profile, mode Mode) ([]Change, error) {
+	return profiles(before, after, mode, true)
+}
+
+func profiles(before, after *profile.Profile, mode Mode, leaves bool) ([]Change, error) {
 	name := displayName(after)
 	if mode == Semantic {
 		a, err := normhash.Normalize(before)
@@ -330,9 +481,9 @@ func Profiles(before, after *profile.Profile, mode Mode) ([]Change, error) {
 		if err != nil {
 			return nil, err
 		}
-		return docChanges(name, docMap(a), docMap(b)), nil
+		return docChanges(name, docMap(a), docMap(b), comparer{equal: canonicalEqual, leaves: leaves}), nil
 	}
-	return rawChanges(name, before, after)
+	return rawChanges(name, before, after, comparer{equal: rawEqual, leaves: leaves})
 }
 
 func docMap(docs []normhash.Doc) map[string]*jsondoc.Value {
@@ -343,21 +494,21 @@ func docMap(docs []normhash.Doc) map[string]*jsondoc.Value {
 	return m
 }
 
-func docChanges(name string, a, b map[string]*jsondoc.Value) []Change {
+func docChanges(name string, a, b map[string]*jsondoc.Value, cmp comparer) []Change {
 	var out []Change
 	for _, path := range unionKeys(a, b) {
 		if path == "manifest.json" {
-			out = append(out, values(name, "profile", a[path], b[path], canonicalEqual)...)
+			out = append(out, values(name, "profile", a[path], b[path], cmp)...)
 			continue
 		}
 		label := strings.TrimSuffix(path, "/manifest.json")
-		out = append(out, pageChanges(name, humanPage(label), a[path], b[path], canonicalEqual)...)
+		out = append(out, pageChanges(name, humanPage(label), label, a[path], b[path], cmp)...)
 	}
 	return out
 }
 
-func rawChanges(name string, before, after *profile.Profile) ([]Change, error) {
-	out := values(name, "profile", before.Manifest, after.Manifest, rawEqual)
+func rawChanges(name string, before, after *profile.Profile, cmp comparer) ([]Change, error) {
+	out := values(name, "profile", before.Manifest, after.Manifest, cmp)
 
 	la, err := normhash.PageLabels(before)
 	if err != nil {
@@ -395,7 +546,7 @@ func rawChanges(name string, before, after *profile.Profile) ([]Change, error) {
 		if pg := after.Pages[k]; pg != nil {
 			b = pg.Manifest
 		}
-		out = append(out, pageChanges(name, humanPage(label)+" ("+k+")", a, b, rawEqual)...)
+		out = append(out, pageChanges(name, humanPage(label)+" ("+k+")", k, a, b, cmp)...)
 	}
 	out = append(out, fileChanges(name, before.Files(), after.Files())...)
 	return out, nil

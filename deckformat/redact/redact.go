@@ -78,8 +78,9 @@ var (
 	deckPlaceholder = regexp.MustCompile(`^<deck\d*>$`)
 )
 
-// isSecretName reports whether a member name says its value is a secret.
-func isSecretName(name string) bool {
+// IsSecretName reports whether a member name says its value is a secret.
+// It is the one home of the rule; callers that decide by member name use it.
+func IsSecretName(name string) bool {
 	if secretSubstring.MatchString(name) {
 		return true
 	}
@@ -309,7 +310,7 @@ func (r *Redactor) String(s string) string {
 		if dec, err := url.QueryUnescape(key); err == nil {
 			key = dec
 		}
-		if isSecretName(key) {
+		if IsSecretName(key) {
 			return m[1] + m[2] + "=" + Redacted
 		}
 		return q
@@ -319,7 +320,7 @@ func (r *Redactor) String(s string) string {
 		key, quote, sep, val := m[1], m[2], m[3], m[4]
 		// "Authorization: Basic <redacted>": the scheme word is not the secret,
 		// the credential after it already went.
-		if !isSecretName(key) || strings.EqualFold(val, "Basic") || strings.EqualFold(val, "Bearer") {
+		if !IsSecretName(key) || strings.EqualFold(val, "Basic") || strings.EqualFold(val, "Bearer") {
 			return kv
 		}
 		if q := val[0]; q == '"' || q == '\'' {
@@ -370,7 +371,7 @@ func (r *Redactor) redactInPlace(v *jsondoc.Value) {
 		pairSecret := false
 		for _, m := range v.Members() {
 			if k := strings.ToLower(m.Name); k == "name" || k == "key" {
-				if s, ok := m.Value.Str(); ok && isSecretName(s) {
+				if s, ok := m.Value.Str(); ok && IsSecretName(s) {
 					pairSecret = true
 				}
 			}
@@ -379,7 +380,7 @@ func (r *Redactor) redactInPlace(v *jsondoc.Value) {
 			if red := r.String(m.Name); red != m.Name {
 				v.RenameMember(i, red)
 			}
-			if isSecretName(m.Name) || (pairSecret && strings.EqualFold(m.Name, "value")) {
+			if IsSecretName(m.Name) || (pairSecret && strings.EqualFold(m.Name, "value")) {
 				r.blank(m.Value)
 				continue
 			}
@@ -551,7 +552,8 @@ var ErrOutputExists = errors.New("redact: output directory is not empty")
 // empty or absent (a directory that cannot be listed is refused, not assumed
 // empty), and the final target must not lie inside any of roots (the folder p
 // was read from, the app's data root), so an export can never write into the
-// app's own data. It returns the absolute path of the profile folder it wrote,
+// app's own data. No roots, or an empty root, is refused with
+// pathguard.ErrNoRoots before anything is read or written. It returns the absolute path of the profile folder it wrote,
 // which differs from outDir/folder when the folder name carried a UUID that was
 // pseudonymized. Every file is created exclusively (O_EXCL), so an existing
 // file, including a hard link to another file, is never opened for writing.
@@ -563,6 +565,11 @@ var ErrOutputExists = errors.New("redact: output directory is not empty")
 // outDir between the guard and the open. The identity re-check after the open
 // narrows that window; it does not remove it.
 func ExportFixture(p *profile.Profile, r *Redactor, outDir, folder string, roots ...string) (string, error) {
+	// RefuseInside below refuses missing roots too; checking first keeps the
+	// refusal independent of how far the export gets.
+	if err := pathguard.RefuseInside(outDir, roots...); errors.Is(err, pathguard.ErrNoRoots) {
+		return "", err
+	}
 	if err := pathguard.SingleName(folder); err != nil {
 		return "", err
 	}

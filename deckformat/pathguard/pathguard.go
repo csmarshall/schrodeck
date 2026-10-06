@@ -37,6 +37,11 @@ var ErrInside = errors.New("pathguard: target is inside a protected directory")
 // refused rather than allowed.
 var ErrUnresolvable = errors.New("pathguard: path cannot be resolved")
 
+// ErrNoRoots means a guard was asked to protect nothing: no root, or an empty
+// one (typically a data-root setting that was never filled in). It refuses
+// rather than allowing every target.
+var ErrNoRoots = errors.New("pathguard: no protected directory given")
+
 // ErrNotName means a name that must be a single path element is not one.
 var ErrNotName = errors.New("pathguard: not a single path element")
 
@@ -51,16 +56,18 @@ var ErrNotName = errors.New("pathguard: not a single path element")
 // only add refusals, never remove them. A root that does not exist yet is
 // compared through its deepest existing ancestor (identity) plus its missing
 // tail (NFC and case folding), since a write would create it.
+//
+// With no roots, or with any empty root, it returns ErrNoRoots (fail closed).
 func RefuseInside(target string, roots ...string) error {
+	if err := checkRoots(roots); err != nil {
+		return err
+	}
 	t, err := Resolve(target)
 	if err != nil {
 		return err
 	}
 	var chain []ancestor // created lazily: only needed when a root is checked by identity
 	for _, root := range roots {
-		if root == "" {
-			continue
-		}
 		r, err := Resolve(root)
 		if err != nil {
 			return err
@@ -109,6 +116,19 @@ func RefuseInside(target string, roots ...string) error {
 			if tt, ok := tailAfter(a.path, t); ok && hasFoldedPrefix(tt, rootTail) {
 				return inside
 			}
+		}
+	}
+	return nil
+}
+
+// checkRoots refuses a guard that would protect nothing.
+func checkRoots(roots []string) error {
+	if len(roots) == 0 {
+		return ErrNoRoots
+	}
+	for i, r := range roots {
+		if r == "" {
+			return fmt.Errorf("%w: root %d of %d is empty", ErrNoRoots, i+1, len(roots))
 		}
 	}
 	return nil
@@ -258,6 +278,9 @@ func Resolve(p string) (string, error) {
 // the file is closed and an error returned. It is not removed, because by then
 // the path may no longer name it.
 func Create(target string, roots ...string) (*os.File, string, error) {
+	if err := checkRoots(roots); err != nil {
+		return nil, "", err
+	}
 	resolved, err := Resolve(target)
 	if err != nil {
 		return nil, "", err

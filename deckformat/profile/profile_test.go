@@ -199,6 +199,12 @@ func TestLoadAllIsolatesBrokenProfiles(t *testing.T) {
 	if len(res.Profiles) != 1 || len(res.Errors) != 1 || len(res.Skipped) != 1 {
 		t.Fatalf("profiles %d, errors %d, skipped %v", len(res.Profiles), len(res.Errors), res.Skipped)
 	}
+	// The error names its folder and still reaches its cause.
+	var fe *FolderError
+	var ue *UnexpectedFileError
+	if !errors.As(res.Errors[0], &fe) || fe.Folder != bad.Folder() || !errors.As(res.Errors[0], &ue) {
+		t.Fatalf("error %v does not name folder %s and its allow-list cause", res.Errors[0], bad.Folder())
+	}
 }
 
 func TestLoadRefusesSymlinks(t *testing.T) {

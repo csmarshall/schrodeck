@@ -109,7 +109,7 @@ func TestExportFixtureLeavesNothingPersonal(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := t.TempDir()
-	if err := exportErr(p, newR(t), out, "FIXTURE.sdProfile"); err != nil {
+	if err := exportErr(p, newR(t), out, "FIXTURE.sdProfile", t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
 	err = filepath.WalkDir(out, func(path string, d os.DirEntry, err error) error {
@@ -339,7 +339,7 @@ func TestExportRefusesManifestThatStopsParsing(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := t.TempDir()
-	err = exportErr(p, newR(t), out, "F.sdProfile")
+	err = exportErr(p, newR(t), out, "F.sdProfile", t.TempDir())
 	if err == nil || !strings.Contains(err.Error(), "manifest.json") || !strings.Contains(err.Error(), "does not parse") {
 		t.Fatalf("collision not refused with the file named: %v", err)
 	}
@@ -562,7 +562,7 @@ func TestExportPseudonymizesUUIDsConsistently(t *testing.T) {
 
 	out := t.TempDir()
 	folder := strings.ToUpper(src.ID) + ".sdProfile"
-	if err := exportErr(p, newR(t), out, folder); err != nil {
+	if err := exportErr(p, newR(t), out, folder, t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
 	var realIDs []string
@@ -613,7 +613,7 @@ func TestExportPseudonymizesUUIDsConsistently(t *testing.T) {
 	}
 	// Two runs give the same names.
 	out2 := t.TempDir()
-	if err := exportErr(p, newR(t), out2, folder); err != nil {
+	if err := exportErr(p, newR(t), out2, folder, t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
 	var names1, names2 []string
@@ -706,7 +706,7 @@ func TestExportReturnsTheWrittenFolder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := ExportFixture(p, newR(t), out, src.Folder())
+	got, err := ExportFixture(p, newR(t), out, src.Folder(), t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -780,5 +780,38 @@ func TestKeyValueSecretsInPlainStrings(t *testing.T) {
 	out := string(r.Value(v).Encode())
 	if strings.Contains(out, "kv1") || strings.Contains(out, "kv8") {
 		t.Errorf("a secret survived Value: %s", out)
+	}
+}
+
+// I6b: an export with no protected root, or with an empty one, refuses
+// instead of guarding nothing, and writes nothing.
+func TestExportWithoutRootsFailsClosed(t *testing.T) {
+	p, err := profile.Load(fixture.XL().FS(), fixture.XL().Folder())
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := t.TempDir()
+	root := filepath.Join(base, "app")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, roots := range map[string][]string{
+		"no roots":          nil,
+		"an empty root":     {""},
+		"an empty root too": {root, ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			out := filepath.Join(base, strings.ReplaceAll(name, " ", "-"))
+			if err := exportErr(p, newR(t), out, "F.sdProfile", roots...); !errors.Is(err, pathguard.ErrNoRoots) {
+				t.Errorf("ExportFixture with roots %q = %v, want pathguard.ErrNoRoots", roots, err)
+			}
+			if _, err := os.Lstat(out); !errors.Is(err, fs.ErrNotExist) {
+				t.Errorf("a refused export created %s: %v", out, err)
+			}
+		})
+	}
+	// Known-good control: the same export with a real root succeeds.
+	if err := exportErr(p, newR(t), filepath.Join(base, "ok"), "F.sdProfile", root); err != nil {
+		t.Fatalf("control: export with a real root = %v", err)
 	}
 }
