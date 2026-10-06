@@ -739,3 +739,46 @@ func TestExportChecksEveryRoot(t *testing.T) {
 		t.Error("a refused export created its output directory")
 	}
 }
+
+// D6/M9: a secret-named key followed by : or = has its value redacted even in
+// a plain string under a member name that says nothing, and a Basic credential
+// is blanked like a Bearer one. Non-secret pairs stay readable.
+func TestKeyValueSecretsInPlainStrings(t *testing.T) {
+	r := newR(t)
+	cases := []struct{ in, want string }{
+		{`token=kv1`, `token=<redacted>`},
+		{`x token=kv2`, `x token=<redacted>`},
+		{`token: kv4`, `token: <redacted>`},
+		{`api_key="kv5"`, `api_key="<redacted>"`},
+		{`api-key = 'kv6'`, `api-key = '<redacted>'`},
+		{`Authorization: Basic kv3`, `Authorization: Basic <redacted>`},
+		{`curl -H "Authorization: Basic kv3x"`, `curl -H "Authorization: Basic <redacted>"`},
+		{`settings={"token":"kv7",}`, `settings={"token":"<redacted>",}`},
+		{`{"token":"kv8"} trailing garbage`, `{"token":"<redacted>"} trailing garbage`},
+		{`{"password":12345,`, `{"password":<redacted>,`},
+		{`run --user=bob userPIN=9876 now`, `run --user=bob userPIN=<redacted> now`},
+		{`Basic kv9`, `Basic <redacted>`},
+		// Controls: nothing secret, nothing changes.
+		{`color=red`, `color=red`},
+		{`name: Bob`, `name: Bob`},
+		{`mapping=a bypass=b`, `mapping=a bypass=b`},
+		{`token=<redacted>`, `token=<redacted>`},
+	}
+	for _, c := range cases {
+		if got := r.String(c.in); got != c.want {
+			t.Errorf("String(%q)\n got %q\nwant %q", c.in, got, c.want)
+		}
+		if got := r.String(r.String(c.in)); got != c.want {
+			t.Errorf("not idempotent for %q: %q", c.in, got)
+		}
+	}
+	// Through Value, under a member name that says nothing.
+	v, err := jsondoc.Parse([]byte(`{"Title":"token=kv1","Note":"{\"token\":\"kv8\"} tail"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := string(r.Value(v).Encode())
+	if strings.Contains(out, "kv1") || strings.Contains(out, "kv8") {
+		t.Errorf("a secret survived Value: %s", out)
+	}
+}

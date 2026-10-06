@@ -67,6 +67,13 @@ var (
 	uuidRe     = regexp.MustCompile(`(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
 	// An Authorization-style bearer credential, whatever member holds it.
 	bearerValue = regexp.MustCompile(`(?i)\bBearer\s+\S+`)
+	// A Basic credential, whatever member holds it. Stops at a quote or a
+	// delimiter, so a credential inside a quoted header keeps its closing quote.
+	basicValue = regexp.MustCompile(`(?i)\bBasic\s+[^\s"',;]+`)
+	// A secret-looking key, optional closing quote, ":" or "=", then its value:
+	// a quoted string, or a run of characters that are not space or a delimiter.
+	// Group 2 is the key word, group 5 the value.
+	keyValue = regexp.MustCompile(`([A-Za-z0-9_-]+)(["']?)([ \t]*[:=][ \t]*)("(?:[^"\\]|\\.)*"|'[^']*'|[^\s"',;&<>{}\[\]()]+)`)
 	// An already-redacted serial, so redacting twice does not renumber it.
 	deckPlaceholder = regexp.MustCompile(`^<deck\d*>$`)
 )
@@ -295,6 +302,7 @@ func (r *Redactor) String(s string) string {
 	s = homeDir.ReplaceAllString(s, "${1}"+User)
 	s = homeDirEnc.ReplaceAllString(s, "${1}"+User)
 	s = bearerValue.ReplaceAllString(s, "Bearer "+Redacted)
+	s = basicValue.ReplaceAllString(s, "Basic "+Redacted)
 	s = queryParam.ReplaceAllStringFunc(s, func(q string) string {
 		m := queryParam.FindStringSubmatch(q)
 		key := m[2]
@@ -305,6 +313,21 @@ func (r *Redactor) String(s string) string {
 			return m[1] + m[2] + "=" + Redacted
 		}
 		return q
+	})
+	s = keyValue.ReplaceAllStringFunc(s, func(kv string) string {
+		m := keyValue.FindStringSubmatch(kv)
+		key, quote, sep, val := m[1], m[2], m[3], m[4]
+		// "Authorization: Basic <redacted>": the scheme word is not the secret,
+		// the credential after it already went.
+		if !isSecretName(key) || strings.EqualFold(val, "Basic") || strings.EqualFold(val, "Bearer") {
+			return kv
+		}
+		if q := val[0]; q == '"' || q == '\'' {
+			val = string(q) + Redacted + string(q)
+		} else {
+			val = Redacted
+		}
+		return key + quote + sep + val
 	})
 	for _, l := range r.literals {
 		s = l.re.ReplaceAllString(s, l.placeholder)
