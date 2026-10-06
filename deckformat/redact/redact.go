@@ -316,7 +316,12 @@ func (r *Redactor) redactInPlace(v *jsondoc.Value) {
 		s, _ := v.Str()
 		// JSON embedded in a string (plugins store settings that way) is parsed,
 		// redacted as a document and put back.
-		if inner := parseEmbedded(s); inner != nil {
+		inner, unparseable := parseEmbedded(s)
+		if unparseable {
+			v.SetString(Redacted)
+			return
+		}
+		if inner != nil {
 			r.redactInPlace(inner)
 			v.SetString(string(inner.Encode()))
 			return
@@ -351,22 +356,32 @@ func (r *Redactor) redactInPlace(v *jsondoc.Value) {
 	}
 }
 
-// parseEmbedded returns the document inside s when the trimmed string is valid
-// JSON with an object or array at the top, in any formatting; nil otherwise. A
-// document that is not already compact is re-encoded compactly, so the format
-// of the embedded string changes when it is redacted.
-func parseEmbedded(s string) *jsondoc.Value {
-	t := strings.TrimSpace(s)
-	if len(t) < 2 || (t[0] != '{' && t[0] != '[') || !json.Valid([]byte(t)) {
-		return nil
+// maxJSONDepth is where encoding/json stops validating; jsondoc's parser has a
+// limit of the same size.
+const maxJSONDepth = 10000
+
+// parseEmbedded returns the document inside s when the trimmed string (after an
+// optional UTF-8 byte order mark) is valid JSON with an object or array at the
+// top, in any formatting; nil otherwise. A document that is not already compact
+// is re-encoded compactly, so the format of the embedded string changes when it
+// is redacted. unparseable is true when the string is JSON that no parser here
+// can take (nesting beyond the limit): it cannot be redacted member by member,
+// so the caller replaces it whole.
+func parseEmbedded(s string) (doc *jsondoc.Value, unparseable bool) {
+	t := strings.TrimSpace(strings.TrimPrefix(s, "\xef\xbb\xbf"))
+	if len(t) < 2 || (t[0] != '{' && t[0] != '[') {
+		return nil, false
+	}
+	if !json.Valid([]byte(t)) {
+		return nil, bracketDepth(t) > maxJSONDepth
 	}
 	if v, err := jsondoc.Parse([]byte(t)); err == nil {
-		return v
+		return v, false
 	}
 	var compact bytes.Buffer
 	if err := json.Compact(&compact, []byte(t)); err == nil {
 		if v, err := jsondoc.Parse(compact.Bytes()); err == nil {
-			return v
+			return v, false
 		}
 	}
 	// Last resort (for example duplicate member names, which jsondoc refuses):
@@ -375,13 +390,38 @@ func parseEmbedded(s string) *jsondoc.Value {
 	dec.UseNumber()
 	var x any
 	if err := dec.Decode(&x); err != nil {
-		return nil
+		return nil, true
 	}
 	v, err := jsondoc.FromAny(numbersToNative(x))
 	if err != nil {
-		return nil
+		return nil, true
 	}
-	return v
+	return v, false
+}
+
+// bracketDepth is the deepest bracket nesting of t outside string literals.
+func bracketDepth(t string) int {
+	depth, deepest, inString := 0, 0, false
+	for i := 0; i < len(t); i++ {
+		c := t[i]
+		switch {
+		case inString:
+			if c == '\\' {
+				i++
+			} else if c == '"' {
+				inString = false
+			}
+		case c == '"':
+			inString = true
+		case c == '[' || c == '{':
+			if depth++; depth > deepest {
+				deepest = depth
+			}
+		case c == ']' || c == '}':
+			depth--
+		}
+	}
+	return deepest
 }
 
 func numbersToNative(x any) any {

@@ -215,6 +215,24 @@ func TestRefuseInsideAbsentRoot(t *testing.T) {
 			t.Fatalf("RefuseInside(%q) = %v, want ErrInside", target, err)
 		}
 	})
+	// Full case folding (APFS), not simple: sharp s folds to "ss" and the fi
+	// ligature to "fi", which strings.EqualFold does not do.
+	for name, c := range map[string]struct{ spelled, real string }{
+		"sharp s":     {"Stra\xc3\x9fe", "Strasse"},
+		"fi ligature": {"Pro\xef\xac\x81les", "Profiles"},
+	} {
+		t.Run("full fold "+name, func(t *testing.T) {
+			probe := filepath.Join(base, "probe-"+c.real)
+			if err := os.Mkdir(probe, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			requireAlias(t, filepath.Join(base, "probe-"+c.spelled))
+			target := filepath.Join(base, c.spelled, "x")
+			if err := RefuseInside(target, filepath.Join(base, c.real)); !errors.Is(err, ErrInside) {
+				t.Fatalf("RefuseInside(%q) = %v, want ErrInside", target, err)
+			}
+		})
+	}
 	t.Run("a different absent name is allowed", func(t *testing.T) {
 		if err := RefuseInside(filepath.Join(base, "Other", "x"), filepath.Join(base, "Settings", "notyet")); err != nil {
 			t.Fatalf("unrelated path refused: %v", err)

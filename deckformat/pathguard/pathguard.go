@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"golang.org/x/text/cases"
 	"golang.org/x/text/unicode/norm"
 )
 
@@ -36,7 +37,7 @@ var ErrNotName = errors.New("pathguard: not a single path element")
 // os.SameFile (device and inode). Identity is the authority because spelling is
 // not: firmlinks (/System/Volumes/Data/...), case folding that strings.ToLower
 // does not reproduce, and Unicode normalization all name one directory in
-// several ways. A cheap case-insensitive string comparison runs first and can
+// several ways. A cheap string comparison under fold runs first and can
 // only add refusals, never remove them. A root that does not exist yet is
 // compared through its deepest existing ancestor (identity) plus its missing
 // tail (NFC and case folding), since a write would create it.
@@ -55,7 +56,7 @@ func RefuseInside(target string, roots ...string) error {
 			return err
 		}
 		inside := fmt.Errorf("%w: %s is inside %s", ErrInside, target, root)
-		if within(strings.ToLower(r), strings.ToLower(t)) {
+		if within(fold(r), fold(t)) {
 			return inside
 		}
 		if chain == nil {
@@ -142,14 +143,20 @@ func tailAfter(prefix, full string) ([]string, bool) {
 	return strings.Split(rel, string(filepath.Separator)), true
 }
 
+// fold is the one definition of "the same name" used by the string checks: NFC
+// normalization, then FULL Unicode case folding (sharp s becomes "ss", the fi
+// ligature "fi"), which is what APFS does. Simple folding (strings.EqualFold,
+// strings.ToLower) misses those.
+func fold(s string) string { return cases.Fold().String(norm.NFC.String(s)) }
+
 // hasFoldedPrefix reports whether the elements of prefix are the leading
-// elements of path, comparing each under NFC normalization and case folding.
+// elements of path under fold.
 func hasFoldedPrefix(path, prefix []string) bool {
 	if len(prefix) > len(path) {
 		return false
 	}
 	for i, p := range prefix {
-		if !strings.EqualFold(norm.NFC.String(path[i]), norm.NFC.String(p)) {
+		if fold(path[i]) != fold(p) {
 			return false
 		}
 	}

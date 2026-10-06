@@ -446,6 +446,7 @@ func TestSecretsAreRedactedEverywhere(t *testing.T) {
 		{`{"payload":"[ {\"name\": \"token\", \"value\": \"emb6\"} ]"}`, "emb6"},
 		{`{"payload":"{\"outer\": {\"password\": \"emb7\", \"p\": \"` + realHome + `\"}}"}`, "alice"},
 		{`{"payload":"{\"token\":\"dup1\",\"token\":\"dup2\", \"n\": 1.5}"}`, "dup"},
+		{"{\"payload\":\"\xef\xbb\xbf{\\\"token\\\":\\\"bom1\\\"}\"}", "bom1"},
 		{`{"u":"https://x/#access_token=frag1"}`, "frag1"},
 		{`{"u":"https://x/?a=1#id_token=frag2"}`, "frag2"},
 		{`{"h":"Authorization: Bearer br3"}`, "br3"},
@@ -593,5 +594,29 @@ func TestExportPseudonymizesUUIDsConsistently(t *testing.T) {
 	}
 	if strings.Join(names1, "|") != strings.Join(names2, "|") {
 		t.Fatalf("export names are not deterministic:\n%v\n%v", names1, names2)
+	}
+}
+
+// Fail closed: a string that is JSON the parsers cannot take (nesting beyond
+// their 10000-level limit, where encoding/json stops validating) is replaced
+// whole rather than left with its secrets in it. Just under the limit it is
+// still parsed and redacted member by member.
+func TestUnparseableEmbeddedJSONIsBlanked(t *testing.T) {
+	r := newR(t)
+	redactedPayload := func(depth int) string {
+		deep := strings.Repeat("[", depth) + `{"token":"deep1"}` + strings.Repeat("]", depth)
+		obj, err := jsondoc.FromAny(map[string]any{"payload": deep})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(r.Value(obj).Encode())
+	}
+	if out := redactedPayload(9990); strings.Contains(out, "deep1") {
+		t.Errorf("depth 9990: secret survives")
+	}
+	for _, depth := range []int{10001, 20000} {
+		if out := redactedPayload(depth); out != `{"payload":"<redacted>"}` {
+			t.Errorf("depth %d: got %.60s (len %d)", depth, out, len(out))
+		}
 	}
 }
