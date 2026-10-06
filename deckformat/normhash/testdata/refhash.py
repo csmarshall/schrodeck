@@ -57,7 +57,7 @@ def main(folder):
         labels[pid.lower()] = "page/%d" % i
     labels[top["Pages"]["Default"].lower()] = "default"
     for low, name in folders.items():
-        labels.setdefault(low, "other/" + name)
+        labels.setdefault(low, "other/" + low)
 
     # top-level manifest
     del top["Device"]["UUID"]

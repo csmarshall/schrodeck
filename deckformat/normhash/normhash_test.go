@@ -16,8 +16,9 @@ import (
 
 // goldenXL is the normalized hash of fixture.XL(), computed by the
 // independent reference implementation testdata/refhash.py (see
-// TestWriteFixtureForReference). If this test fails after a fixture change,
-// recompute it with the reference, never by copying the Go output.
+// TestWriteFixtureForReference). This shows the two implementations agree on
+// this fixture. If this test fails after a fixture change, recompute it with
+// the reference, never by copying the Go output.
 const goldenXL = "3224b89189a93d552a4c479bae1b722c185489a7d8597cc4c8f680f444737200"
 
 func loadP(t *testing.T, fp fixture.Profile) *profile.Profile {
@@ -79,6 +80,9 @@ func onlyActionIDs(p fixture.Profile) fixture.Profile {
 	return c
 }
 
+// onlyImageNames creates a copy with renamed image files. CopyOf also changes
+// page IDs and ActionIDs, but the test's off-config (hashImages=false)
+// neutralizes those changes, leaving only the image name change visible.
 func onlyImageNames(p fixture.Profile) fixture.Profile {
 	c := fixture.CopyOf(p, "images")
 	for i := range c.Pages {
@@ -239,5 +243,47 @@ func TestPathsAreCanonical(t *testing.T) {
 	}
 	if got := strings.Join(paths, " "); got != "default/manifest.json manifest.json page/0/manifest.json page/1/manifest.json" {
 		t.Fatalf("paths = %s", got)
+	}
+}
+
+// --- golden value for relabeling, missing images, and "other" pages --------
+
+// goldenRelabelMissingOther is the normalized hash of a fixture variant that
+// exercises page relabeling, missing images, and "other" (unreferenced) pages.
+// Computed with the independent reference implementation (testdata/refhash.py).
+// This proves the hash correctly handles all three normalization aspects.
+const goldenRelabelMissingOther = "2c1fe89b79146526194a470d7e63a34607c69837d2a6641bea57be4322b3c60c"
+
+func fixtureWithRelabelMissingOther() fixture.Profile {
+	p := fixture.XL()
+	// Add settings that reference page UUIDs in upper case, including nested in an array
+	p.Pages[0].Buttons[0].Settings = `{"pages":["` + strings.ToUpper(p.Pages[1].ID) + `"],"target":"` + strings.ToUpper(p.Pages[0].ID) + `"}`
+	// Mark one button's image as missing
+	p.Pages[0].Buttons[1].MissingImage = true
+	// Add an "other" page (not in Pages.Pages or Default)
+	otherPage := fixture.Page{ID: "aaaaaaaa-0000-4000-8000-0000000000ff", Buttons: []fixture.Button{
+		{Slot: "0,0", ActionID: "11111111-0000-4000-8000-000000000099", Plugin: "com.elgato.streamdeck.system.open",
+			Settings: `{"path":"/other"}`, Title: "Other", Image: "IMG00000000000000000000000099.png", ImageSeed: 99},
+	}}
+	p.Pages = append(p.Pages, otherPage)
+	return p
+}
+
+func TestWriteFixtureRelabelMissingOtherForReference(t *testing.T) {
+	out := os.Getenv("NORMHASH_FIXTURE_OUT")
+	if out == "" {
+		t.Skip("set NORMHASH_FIXTURE_OUT to write the fixture for the reference implementation")
+	}
+	p := fixtureWithRelabelMissingOther()
+	if err := fixture.WriteTo(out, p.FS()); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("wrote %s/%s", out, p.Folder())
+}
+
+func TestGoldenCoversRelabelMissingAndOther(t *testing.T) {
+	p := fixtureWithRelabelMissingOther()
+	if got := hash(t, p); got != goldenRelabelMissingOther {
+		t.Fatalf("Hash(fixtureWithRelabelMissingOther()) = %s, reference says %s", got, goldenRelabelMissingOther)
 	}
 }

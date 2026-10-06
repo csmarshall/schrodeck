@@ -116,9 +116,9 @@ func PageLabels(p *profile.Profile) (map[string]string, error) {
 			return nil, fmt.Errorf("%s: %s: %w", p.Folder, id, ErrDanglingPage)
 		}
 	}
-	for id, pg := range p.Pages {
+	for id := range p.Pages {
 		if _, ok := labels[id]; !ok {
-			labels[id] = "other/" + pg.Folder
+			labels[id] = "other/" + strings.ToLower(id)
 		}
 	}
 	return labels, nil
