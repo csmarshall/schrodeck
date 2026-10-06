@@ -251,8 +251,9 @@ func TestPathsAreCanonical(t *testing.T) {
 // goldenRelabelMissingOther is the normalized hash of a fixture variant that
 // exercises page relabeling, missing images, and "other" (unreferenced) pages.
 // Computed with the independent reference implementation (testdata/refhash.py).
-// This proves the hash correctly handles all three normalization aspects.
-const goldenRelabelMissingOther = "2c1fe89b79146526194a470d7e63a34607c69837d2a6641bea57be4322b3c60c"
+// This proves the hash correctly handles page-UUID relabeling in Settings and
+// the lower-case UUID labeling of unreferenced pages.
+const goldenRelabelMissingOther = "7201a84cf63ab71ab515ff375cdbf3426b07190a76b2652f531c2572aa144a7e"
 
 func fixtureWithRelabelMissingOther() fixture.Profile {
 	p := fixture.XL()
@@ -260,12 +261,20 @@ func fixtureWithRelabelMissingOther() fixture.Profile {
 	p.Pages[0].Buttons[0].Settings = `{"pages":["` + strings.ToUpper(p.Pages[1].ID) + `"],"target":"` + strings.ToUpper(p.Pages[0].ID) + `"}`
 	// Mark one button's image as missing
 	p.Pages[0].Buttons[1].MissingImage = true
-	// Add an "other" page (not in Pages.Pages or Default)
-	otherPage := fixture.Page{ID: "aaaaaaaa-0000-4000-8000-0000000000ff", Buttons: []fixture.Button{
-		{Slot: "0,0", ActionID: "11111111-0000-4000-8000-000000000099", Plugin: "com.elgato.streamdeck.system.open",
-			Settings: `{"path":"/other"}`, Title: "Other", Image: "IMG00000000000000000000000099.png", ImageSeed: 99},
-	}}
-	p.Pages = append(p.Pages, otherPage)
+
+	// Create an "other" page (on disk but not in Pages.Pages or Default).
+	// We add it to the file system via Extra, so it exists on disk but is not listed.
+	otherPageFolder := "AAAAAAAA-0000-4000-8000-0000000000FF"
+
+	// Construct the page manifest
+	otherPageManifest := []byte(`{"Controllers":[{"Actions":{"0,0":{"ActionID":"11111111-0000-4000-8000-000000000099","LinkedTitle":true,"Name":"open","Plugin":{"Name":"Fixture","UUID":"com.elgato.streamdeck.system.open","Version":"1.0"},"Resources":null,"Settings":{"path":"/other"},"State":0,"States":[{"Image":"Images/IMG00000000000000000000000099.png","Title":"Other"}],"UUID":"com.elgato.streamdeck.system.open"}},"Type":"Keypad"}],"Icon":"","Name":""}`)
+
+	if p.Extra == nil {
+		p.Extra = make(map[string][]byte)
+	}
+	p.Extra["Profiles/"+otherPageFolder+"/manifest.json"] = otherPageManifest
+	p.Extra["Profiles/"+otherPageFolder+"/Images/IMG00000000000000000000000099.png"] = fixture.PNG(99)
+
 	return p
 }
 
@@ -283,6 +292,24 @@ func TestWriteFixtureRelabelMissingOtherForReference(t *testing.T) {
 
 func TestGoldenCoversRelabelMissingAndOther(t *testing.T) {
 	p := fixtureWithRelabelMissingOther()
+	lp := loadP(t, p)
+
+	// Verify that the "other" page is present in the normalized paths
+	docs, err := Normalize(lp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var foundOtherLabel bool
+	for _, d := range docs {
+		if strings.Contains(d.Path, "other/aaaaaaaa-0000-4000-8000-0000000000ff") {
+			foundOtherLabel = true
+		}
+	}
+	if !foundOtherLabel {
+		t.Fatal("expected to find 'other/<lower-case UUID>' path in normalized docs")
+	}
+
+	// Verify golden value
 	if got := hash(t, p); got != goldenRelabelMissingOther {
 		t.Fatalf("Hash(fixtureWithRelabelMissingOther()) = %s, reference says %s", got, goldenRelabelMissingOther)
 	}
