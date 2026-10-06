@@ -23,6 +23,7 @@ import (
 	"image"
 	"image/color"
 	"image/png"
+	"io/fs"
 	"net/url"
 	"os"
 	"path"
@@ -512,8 +513,13 @@ var ErrOutputExists = errors.New("redact: output directory is not empty")
 // ExportFixture writes a redacted copy of p to outDir/<folder>: manifests
 // redacted, UUIDs pseudonymized (in manifests, folder names and paths), images
 // replaced by SyntheticPNG. folder must be a single path element, outDir must be
-// empty or absent, and the final target must not lie inside sourceRoot (the
-// folder p was read from), so an export can never write into the app's own data.
+// empty or absent (a directory that cannot be listed is refused, not assumed
+// empty), and the final target must not lie inside any of roots (the folder p
+// was read from, the app's data root), so an export can never write into the
+// app's own data. It returns the absolute path of the profile folder it wrote,
+// which differs from outDir/folder when the folder name carried a UUID that was
+// pseudonymized. Every file is created exclusively (O_EXCL), so an existing
+// file, including a hard link to another file, is never opened for writing.
 //
 // The guard decides by file identity on the path the kernel will reach, and the
 // files are written through an os.Root opened on that exact directory, so a
@@ -521,9 +527,9 @@ var ErrOutputExists = errors.New("redact: output directory is not empty")
 // no path check can close: someone with write access renaming an ANCESTOR of
 // outDir between the guard and the open. The identity re-check after the open
 // narrows that window; it does not remove it.
-func ExportFixture(p *profile.Profile, r *Redactor, sourceRoot, outDir, folder string) error {
+func ExportFixture(p *profile.Profile, r *Redactor, outDir, folder string, roots ...string) (string, error) {
 	if err := pathguard.SingleName(folder); err != nil {
-		return err
+		return "", err
 	}
 	outFolder := r.pseudonymizeUUIDs(folder, true)
 	// Resolve outDir the way the kernel will (never filepath.Abs, which cleans
@@ -531,17 +537,22 @@ func ExportFixture(p *profile.Profile, r *Redactor, sourceRoot, outDir, folder s
 	// exactly that resolved path so the check and the write cannot disagree.
 	resolvedOut, err := pathguard.Resolve(outDir)
 	if err != nil {
-		return err
+		return "", err
 	}
 	finalTarget, err := pathguard.Resolve(filepath.Join(resolvedOut, outFolder))
 	if err != nil {
-		return err
+		return "", err
 	}
-	if err := pathguard.RefuseInside(finalTarget, sourceRoot); err != nil {
-		return err
+	if err := pathguard.RefuseInside(finalTarget, roots...); err != nil {
+		return "", err
 	}
-	if entries, err := os.ReadDir(resolvedOut); err == nil && len(entries) > 0 {
-		return ErrOutputExists
+	// Only "absent" is tolerated: a directory that cannot be listed (mode 0300,
+	// a file in its place) might hold anything, so it is refused.
+	switch entries, err := os.ReadDir(resolvedOut); {
+	case err == nil && len(entries) > 0:
+		return "", ErrOutputExists
+	case err != nil && !errors.Is(err, fs.ErrNotExist):
+		return "", err
 	}
 	// Redact and re-parse every manifest before anything is written: a manifest
 	// that no longer parses (for example two member names redacted into one)
@@ -559,13 +570,13 @@ func ExportFixture(p *profile.Profile, r *Redactor, sourceRoot, outDir, folder s
 		if strings.HasSuffix(rel, "manifest.json") {
 			doc, err := jsondoc.Parse(data)
 			if err != nil {
-				return fmt.Errorf("%s: %w", rel, err)
+				return "", fmt.Errorf("%s: %w", rel, err)
 			}
 			doc = r.Value(doc)
 			r.pseudonymizeValue(doc)
 			data = doc.Encode()
 			if _, err := jsondoc.Parse(data); err != nil {
-				return fmt.Errorf("redact: %s does not parse after redaction, nothing written: %w", rel, err)
+				return "", fmt.Errorf("redact: %s does not parse after redaction, nothing written: %w", rel, err)
 			}
 		} else {
 			data = SyntheticPNG(data)
@@ -579,38 +590,51 @@ func ExportFixture(p *profile.Profile, r *Redactor, sourceRoot, outDir, folder s
 	sort.Strings(outRels)
 
 	if err := os.MkdirAll(finalTarget, 0o755); err != nil {
-		return err
+		return "", err
 	}
 	root, err := os.OpenRoot(finalTarget)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer root.Close()
 	// The directory opened must be the directory that was checked, and must
 	// still not be inside the source.
 	opened, err := root.Stat(".")
 	if err != nil {
-		return err
+		return "", err
 	}
 	checked, err := os.Stat(finalTarget)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if !os.SameFile(opened, checked) {
-		return fmt.Errorf("redact: %s changed while the export was starting", finalTarget)
+		return "", fmt.Errorf("redact: %s changed while the export was starting", finalTarget)
 	}
-	if err := pathguard.RefuseInside(finalTarget, sourceRoot); err != nil {
-		return err
+	if err := pathguard.RefuseInside(finalTarget, roots...); err != nil {
+		return "", err
 	}
 	for _, rel := range outRels {
 		if dir := path.Dir(rel); dir != "." {
 			if err := root.MkdirAll(filepath.FromSlash(dir), 0o755); err != nil {
-				return err
+				return "", err
 			}
 		}
-		if err := root.WriteFile(filepath.FromSlash(rel), redacted[rel], 0o644); err != nil {
-			return err
+		if err := writeNew(root, filepath.FromSlash(rel), redacted[rel]); err != nil {
+			return "", err
 		}
 	}
-	return nil
+	return finalTarget, nil
+}
+
+// writeNew creates name below root exclusively and writes data to it.
+func writeNew(root *os.Root, name string, data []byte) error {
+	f, err := root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
 }

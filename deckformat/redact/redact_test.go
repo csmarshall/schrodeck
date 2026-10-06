@@ -96,6 +96,12 @@ func personal() fixture.Profile {
 	return p
 }
 
+// exportErr is ExportFixture for the tests that only care whether it failed.
+func exportErr(p *profile.Profile, r *Redactor, outDir, folder string, roots ...string) error {
+	_, err := ExportFixture(p, r, outDir, folder, roots...)
+	return err
+}
+
 func TestExportFixtureLeavesNothingPersonal(t *testing.T) {
 	src := personal()
 	p, err := profile.Load(src.FS(), src.Folder())
@@ -103,7 +109,7 @@ func TestExportFixtureLeavesNothingPersonal(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := t.TempDir()
-	if err := ExportFixture(p, newR(t), "", out, "FIXTURE.sdProfile"); err != nil {
+	if err := exportErr(p, newR(t), out, "FIXTURE.sdProfile"); err != nil {
 		t.Fatal(err)
 	}
 	err = filepath.WalkDir(out, func(path string, d os.DirEntry, err error) error {
@@ -164,20 +170,20 @@ func TestExportRefusesUnsafeTargets(t *testing.T) {
 	p, _ := profile.Load(fixture.XL().FS(), fixture.XL().Folder())
 	r := newR(t)
 	src := t.TempDir()
-	if err := ExportFixture(p, r, src, filepath.Join(src, "inside"), "F.sdProfile"); !errors.Is(err, pathguard.ErrInside) {
+	if err := exportErr(p, r, filepath.Join(src, "inside"), "F.sdProfile", src); !errors.Is(err, pathguard.ErrInside) {
 		t.Fatalf("export into the source tree: %v", err)
 	}
 	full := t.TempDir()
 	if err := os.WriteFile(filepath.Join(full, "x"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := ExportFixture(p, r, src, full, "F.sdProfile"); !errors.Is(err, ErrOutputExists) {
+	if err := exportErr(p, r, full, "F.sdProfile", src); !errors.Is(err, ErrOutputExists) {
 		t.Fatalf("export into a non-empty dir: %v", err)
 	}
 	// Known-bad: a folder name that walks out of outDir and back into the source.
 	out := filepath.Join(filepath.Dir(src), "out")
 	escape := filepath.Join("..", filepath.Base(src), "F.sdProfile")
-	if err := ExportFixture(p, r, src, out, escape); !errors.Is(err, pathguard.ErrNotName) {
+	if err := exportErr(p, r, out, escape, src); !errors.Is(err, pathguard.ErrNotName) {
 		t.Fatalf("a ../ folder name was accepted: %v", err)
 	}
 	// Known-bad: an output directory that is a symlink into the source.
@@ -185,7 +191,7 @@ func TestExportRefusesUnsafeTargets(t *testing.T) {
 	if err := os.Symlink(src, link); err != nil {
 		t.Fatal(err)
 	}
-	if err := ExportFixture(p, r, src, link, "F.sdProfile"); !errors.Is(err, pathguard.ErrInside) {
+	if err := exportErr(p, r, link, "F.sdProfile", src); !errors.Is(err, pathguard.ErrInside) {
 		t.Fatalf("export through a symlink into the source tree: %v", err)
 	}
 	if entries, _ := os.ReadDir(src); len(entries) != 0 {
@@ -207,7 +213,7 @@ func TestExportRefusesDotDotAfterSymlink(t *testing.T) {
 	if err := os.Symlink(filepath.Join(src, "sub"), link); err != nil {
 		t.Fatal(err)
 	}
-	if err := ExportFixture(p, newR(t), src, link+"/../out", "F.sdProfile"); !errors.Is(err, pathguard.ErrInside) {
+	if err := exportErr(p, newR(t), link+"/../out", "F.sdProfile", src); !errors.Is(err, pathguard.ErrInside) {
 		t.Fatalf("export through <link>/../ into the source tree: %v", err)
 	}
 	for _, landed := range []string{filepath.Join(src, "out"), filepath.Join(base, "out")} {
@@ -230,7 +236,7 @@ func TestExportWritesWhereTheGuardChecked(t *testing.T) {
 	if err := os.Symlink(dest, link); err != nil {
 		t.Fatal(err)
 	}
-	if err := ExportFixture(p, newR(t), filepath.Join(base, "src"), link, "F.sdProfile"); err != nil {
+	if err := exportErr(p, newR(t), link, "F.sdProfile", filepath.Join(base, "src")); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(dest, "F.sdProfile", "manifest.json")); err != nil {
@@ -304,7 +310,7 @@ func TestExportRefusesManifestThatStopsParsing(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := t.TempDir()
-	err = ExportFixture(p, newR(t), "", out, "F.sdProfile")
+	err = exportErr(p, newR(t), out, "F.sdProfile")
 	if err == nil || !strings.Contains(err.Error(), "manifest.json") || !strings.Contains(err.Error(), "does not parse") {
 		t.Fatalf("collision not refused with the file named: %v", err)
 	}
@@ -348,7 +354,7 @@ func TestExportRefusesAliasedOutputIntoSource(t *testing.T) {
 			if _, err := os.Stat(filepath.Dir(out)); err != nil {
 				t.Skipf("this file system does not alias %s: %v", filepath.Dir(out), err)
 			}
-			if err := ExportFixture(p, newR(t), src, out, "F.sdProfile"); !errors.Is(err, pathguard.ErrInside) {
+			if err := exportErr(p, newR(t), out, "F.sdProfile", src); !errors.Is(err, pathguard.ErrInside) {
 				t.Fatalf("export through an alias of the source tree: %v", err)
 			}
 			if n := countFiles(t, src); n != 0 {
@@ -369,7 +375,7 @@ func TestExportRefusesDotDotAfterMissingComponent(t *testing.T) {
 	if err := os.Symlink(src, filepath.Join(base, "innocent")); err != nil {
 		t.Fatal(err)
 	}
-	err := ExportFixture(p, newR(t), src, base+"/nonexist/../innocent/out", "F.sdProfile")
+	err := exportErr(p, newR(t), base+"/nonexist/../innocent/out", "F.sdProfile", src)
 	if !errors.Is(err, pathguard.ErrUnresolvable) {
 		t.Fatalf("export via a missing component then '..': %v", err)
 	}
@@ -395,7 +401,7 @@ func TestExportWritesToTheCheckedPathNotTheCleanedOne(t *testing.T) {
 	if err := os.Symlink(dest, link); err != nil {
 		t.Fatal(err)
 	}
-	if err := ExportFixture(p, newR(t), filepath.Join(base, "src"), link+"/../out2", "F.sdProfile"); err != nil {
+	if err := exportErr(p, newR(t), link+"/../out2", "F.sdProfile", filepath.Join(base, "src")); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(base, "deep", "out2", "F.sdProfile", "manifest.json")); err != nil {
@@ -527,7 +533,7 @@ func TestExportPseudonymizesUUIDsConsistently(t *testing.T) {
 
 	out := t.TempDir()
 	folder := strings.ToUpper(src.ID) + ".sdProfile"
-	if err := ExportFixture(p, newR(t), "", out, folder); err != nil {
+	if err := exportErr(p, newR(t), out, folder); err != nil {
 		t.Fatal(err)
 	}
 	var realIDs []string
@@ -578,7 +584,7 @@ func TestExportPseudonymizesUUIDsConsistently(t *testing.T) {
 	}
 	// Two runs give the same names.
 	out2 := t.TempDir()
-	if err := ExportFixture(p, newR(t), "", out2, folder); err != nil {
+	if err := exportErr(p, newR(t), out2, folder); err != nil {
 		t.Fatal(err)
 	}
 	var names1, names2 []string
@@ -618,5 +624,89 @@ func TestUnparseableEmbeddedJSONIsBlanked(t *testing.T) {
 		if out := redactedPayload(depth); out != `{"payload":"<redacted>"}` {
 			t.Errorf("depth %d: got %.60s (len %d)", depth, out, len(out))
 		}
+	}
+}
+
+// Known-bad (I3): an output directory the exporter cannot list (mode 0300)
+// holding a hard link to a protected file. An unreadable directory used to be
+// treated as empty, and the export then wrote through the link and overwrote
+// the protected file.
+func TestExportDoesNotOverwriteAHardLinkedSource(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can list a mode 0300 directory, so the case does not arise")
+	}
+	p, _ := profile.Load(fixture.XL().FS(), fixture.XL().Folder())
+	base := t.TempDir()
+	src := filepath.Join(base, "src")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	protected := filepath.Join(src, "manifest.json")
+	if err := os.WriteFile(protected, []byte("original"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(base, "out")
+	if err := os.MkdirAll(filepath.Join(out, "F.sdProfile"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(protected, filepath.Join(out, "F.sdProfile", "manifest.json")); err != nil {
+		t.Skipf("no hard links here: %v", err)
+	}
+	if err := os.Chmod(out, 0o300); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(out, 0o755) })
+	if err := exportErr(p, newR(t), out, "F.sdProfile", src); err == nil {
+		t.Error("an export into a directory that cannot be listed was allowed")
+	}
+	if got, _ := os.ReadFile(protected); string(got) != "original" {
+		t.Fatalf("the protected file was overwritten: %.60q", got)
+	}
+}
+
+// I4: the folder name is pseudonymized, so the caller needs the path it was
+// really written to.
+func TestExportReturnsTheWrittenFolder(t *testing.T) {
+	src := fixture.XL()
+	src.ID = "bbbbbbbb-1111-4222-8333-444444444444" // not the synthetic shape, so pseudonymizing changes the name
+	p, err := profile.Load(src.FS(), src.Folder())
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := ExportFixture(p, newR(t), out, src.Folder())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(strings.ToLower(got), src.ID) {
+		t.Errorf("returned path %q still carries the real profile id", got)
+	}
+	if !filepath.IsAbs(got) || filepath.Dir(got) != out {
+		t.Errorf("returned path %q is not an absolute folder directly in %q", got, out)
+	}
+	if _, err := os.Stat(filepath.Join(got, "manifest.json")); err != nil {
+		t.Errorf("no manifest at the returned path: %v", err)
+	}
+}
+
+// M10: every root is checked, not only the first.
+func TestExportChecksEveryRoot(t *testing.T) {
+	p, _ := profile.Load(fixture.XL().FS(), fixture.XL().Folder())
+	base := t.TempDir()
+	first, second := filepath.Join(base, "first"), filepath.Join(base, "second")
+	for _, d := range []string{first, second} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	err := exportErr(p, newR(t), filepath.Join(second, "out"), "F.sdProfile", first, second)
+	if !errors.Is(err, pathguard.ErrInside) {
+		t.Fatalf("export inside the second root: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(second, "out")); err == nil {
+		t.Error("a refused export created its output directory")
 	}
 }
