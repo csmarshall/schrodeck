@@ -226,6 +226,7 @@ func Compare(name string, before, after *Snapshot, r *redact.Redactor) (Report, 
 	}
 	sort.Strings(sorted)
 	var changes []semdiff.Change
+	var changeFolder []string // the profile folder behind each change
 	for _, folder := range sorted {
 		alias := ps.profileAlias(folder)
 		a, b := before.Profiles[folder], after.Profiles[folder]
@@ -244,16 +245,22 @@ func Compare(name string, before, after *Snapshot, r *redact.Redactor) (Report, 
 			}
 			changes = append(changes, cs...)
 		}
+		for len(changeFolder) < len(changes) {
+			changeFolder = append(changeFolder, folder)
+		}
 	}
 	if before.Prefs != nil || after.Prefs != nil {
 		changes = append(changes, semdiff.Values("app preferences", "prefs", before.Prefs, after.Prefs)...)
+		for len(changeFolder) < len(changes) {
+			changeFolder = append(changeFolder, "")
+		}
 	}
 	for i := range changes {
 		c := &changes[i]
 		if c.Where == "profile" && c.Path == "Name" {
 			// The profile's own name is user content: both sides become its alias.
 			c.Before, c.After = renamed(c.Before, c.Profile), renamed(c.After, c.Profile)
-		} else if blanksValues(c) {
+		} else if blanksValues(c) || siblingNamesSecret(changeFolder[i], before, after, c) {
 			c.Before, c.After = blank(c.Before), blank(c.After)
 		} else {
 			c.Before, c.After = redactJSON(r, c.Before), redactJSON(r, c.After)
@@ -420,7 +427,8 @@ func (rep Report) Markdown() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# Observation: %s\n\n", rep.Name)
 	fmt.Fprintf(&b, "- Before: %s · After: %s · App: %s · norm_version: %d\n", rep.Before.Format(time.RFC3339), rep.After.Format(time.RFC3339), rep.AppVersion, normhash.NormVersion)
-	fmt.Fprintf(&b, "- Changes (raw, redacted): %d\n\n", len(rep.Changes))
+	fmt.Fprintf(&b, "- Changes (raw, redacted): %d\n", len(rep.Changes))
+	b.WriteString("- Titles, page names and setting values are shown as-is; review before committing.\n\n")
 	if len(rep.Changes) > 0 {
 		b.WriteString("| Profile | Where | Path | Change | Before | After |\n|---|---|---|---|---|---|\n")
 		for _, c := range rep.Changes {
@@ -449,4 +457,110 @@ func (rep Report) EvidenceRow() string {
 	}
 	return fmt.Sprintf("| R?? | <topic> | **Observed** | `schrodeck observe %s`, app %s, %s | %s. Full report: [observations/%s.md](observations/%s.md) |",
 		rep.Name, rep.AppVersion, rep.After.Format("2006-01-02"), escape(strings.Join(summary, "; ")), rep.Name, rep.Name)
+}
+
+// siblingNamesSecret handles the name/value pair shape, {"name":"token",
+// "value":"…"}, where the secret is a sibling of the changed leaf rather than
+// on its path. For a change whose last path segment is a member named "value"
+// it resolves the parent object in each snapshot of the profile (page changes
+// carry their path relative to the key slot named in Where, so every page
+// manifest is a candidate root) and reports true when a sibling "name" or
+// "key" holds a secret-like string, or when no parent can be resolved at all
+// (fail closed). A side on which the value is absent (added or removed) is
+// not searched.
+func siblingNamesSecret(folder string, before, after *Snapshot, c *semdiff.Change) bool {
+	if c.Where == "files" || c.Where == "profiles" {
+		return false
+	}
+	segs, err := semdiff.ParsePath(c.Path)
+	if err != nil {
+		return true
+	}
+	if len(segs) == 0 || segs[len(segs)-1].IsIndex || !strings.EqualFold(segs[len(segs)-1].Name, "value") {
+		return false
+	}
+	parentPath := segs[:len(segs)-1]
+	slot := ""
+	if _, after, ok := strings.Cut(c.Where, " › "); ok {
+		if fields := strings.Fields(after); len(fields) == 2 {
+			slot = fields[1]
+		}
+	}
+	resolved := false
+	for _, side := range []struct {
+		snap    *Snapshot
+		present bool
+	}{{before, c.Before != ""}, {after, c.After != ""}} {
+		if !side.present {
+			continue
+		}
+		for _, root := range candidateRoots(side.snap, folder, c.Where, slot) {
+			parent := walk(root, parentPath)
+			if parent == nil || parent.Kind() != jsondoc.Object {
+				continue
+			}
+			resolved = true
+			for _, m := range parent.Members() {
+				if !strings.EqualFold(m.Name, "name") && !strings.EqualFold(m.Name, "key") {
+					continue
+				}
+				if str, ok := m.Value.Str(); ok && redact.IsSecretName(str) {
+					return true
+				}
+			}
+		}
+	}
+	return !resolved
+}
+
+// candidateRoots lists the JSON documents a change's path may be relative to.
+func candidateRoots(s *Snapshot, folder, where, slot string) []*jsondoc.Value {
+	switch {
+	case where == "prefs":
+		if s.Prefs != nil {
+			return []*jsondoc.Value{s.Prefs}
+		}
+		return nil
+	case where == "profile":
+		if p := s.Profiles[folder]; p != nil {
+			return []*jsondoc.Value{p.Manifest}
+		}
+		return nil
+	}
+	p := s.Profiles[folder]
+	if p == nil {
+		return nil
+	}
+	var roots []*jsondoc.Value
+	for _, pg := range p.Pages {
+		if slot == "" {
+			roots = append(roots, pg.Manifest)
+			continue
+		}
+		for _, ctl := range pg.Manifest.Get("Controllers").Items() {
+			if action := ctl.Get("Actions").Get(slot); action != nil {
+				roots = append(roots, action)
+			}
+		}
+	}
+	return roots
+}
+
+// walk follows segments from v, returning nil when the path does not exist.
+func walk(v *jsondoc.Value, segs []semdiff.Segment) *jsondoc.Value {
+	for _, sg := range segs {
+		if v == nil {
+			return nil
+		}
+		if sg.IsIndex {
+			items := v.Items()
+			if sg.Index >= len(items) {
+				return nil
+			}
+			v = items[sg.Index]
+		} else {
+			v = v.Get(sg.Name)
+		}
+	}
+	return v
 }

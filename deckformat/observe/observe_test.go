@@ -105,6 +105,7 @@ func TestCompareReportsAndRedacts(t *testing.T) {
 	md := rep.Markdown()
 	for _, want := range []string{
 		"# Observation: u0-title",
+		"Titles, page names and setting values are shown as-is; review before committing.",
 		"page 1 (profile-1/page/0) › key 1,0",
 		`"Paste"`,
 		"@(1)[4057/143/<deck>]",
@@ -391,5 +392,50 @@ func TestProfileRenameIsAliased(t *testing.T) {
 	}
 	if !strings.Contains(rawText.String(), "Old Secret Name") || !strings.Contains(rawText.String(), "New Secret Name") {
 		t.Fatalf("control: the raw diff has no names:\n%s", rawText.String())
+	}
+}
+
+func TestNameValuePairsWithSecretNamesAreBlanked(t *testing.T) {
+	pair := func(tok, color string) string {
+		return `{"items":[{"name":"token","value":"` + tok + `"},{"name":"color","value":"` + color + `"}]}`
+	}
+	before := take(t, settingsXL(t, pair("q3-ONE", "red")), nil, t0)
+	after := take(t, settingsXL(t, pair("w3-TWO", "blue")), nil, t0.Add(time.Minute))
+	rep, err := Compare("pairs", before, after, redactor(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := rep.Markdown() + "\n" + rep.EvidenceRow()
+	for _, leak := range []string{"q3-ONE", "w3-TWO"} {
+		if strings.Contains(out, leak) {
+			t.Errorf("report leaks %q:\n%s", leak, out)
+		}
+	}
+	if !strings.Contains(out, `"red"`) || !strings.Contains(out, `"blue"`) {
+		t.Errorf("the non-secret pair must stay visible:\n%s", out)
+	}
+	// Known-bad control: the raw diff carries both secret values.
+	raw, err := semdiff.Sets(before.Profiles, after.Profiles, semdiff.Raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rawText strings.Builder
+	for _, c := range raw {
+		rawText.WriteString(c.String() + "\n")
+	}
+	if !strings.Contains(rawText.String(), "q3-ONE") || !strings.Contains(rawText.String(), "w3-TWO") {
+		t.Fatalf("control: the raw diff lacks the values:\n%s", rawText.String())
+	}
+}
+
+func TestUnresolvablePairParentFailsClosed(t *testing.T) {
+	s := take(t, fixture.XL(), nil, t0)
+	c := semdiff.Change{Where: "page 1 › key 0,0", Path: "Settings.nowhere[3].value", Kind: semdiff.Modified, Before: `"a"`, After: `"b"`}
+	folder := ""
+	for f := range s.Profiles {
+		folder = f
+	}
+	if !siblingNamesSecret(folder, s, s, &c) {
+		t.Fatal("an unresolvable parent must be treated as secret")
 	}
 }
