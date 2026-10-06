@@ -92,9 +92,16 @@ func loadErrorText(e error) string {
 	return e.Error()
 }
 
-// redactor builds the redactor for this host. Names under 3 characters are
-// skipped (redact.New refuses them) and the generic rules still apply.
-func redactor(env Env, moreIDs ...string) (*redact.Redactor, error) {
+// redactor builds the redactor for this host, with the serials of every
+// device id the host reports now (deviceIDs).
+func redactor(env Env) (*redact.Redactor, error) {
+	return redactorFor(env, deviceIDs(env))
+}
+
+// redactorFor builds a redactor from this host's user and host names and the
+// serials of ids. Names under 3 characters are skipped (redact.New refuses
+// them) and the generic rules still apply.
+func redactorFor(env Env, ids []string) (*redact.Redactor, error) {
 	var users, hosts []string
 	if env.Host != nil {
 		if u := env.Host.Identity.UserName(); len(u) >= 3 {
@@ -107,7 +114,7 @@ func redactor(env Env, moreIDs ...string) (*redact.Redactor, error) {
 		}
 	}
 	var serials []string
-	for _, s := range redact.SerialsFrom(append(deviceIDs(env), moreIDs...)...) {
+	for _, s := range redact.SerialsFrom(ids...) {
 		if len(s) >= 3 {
 			serials = append(serials, s)
 		}
@@ -314,7 +321,9 @@ func runInventory(_ context.Context, env Env, args []string) (result, error) {
 		} else {
 			pi.HashError = show(err.Error())
 		}
-		pi.AppIdentifier, _ = p.AppIdentifier()
+		if app, ok := p.AppIdentifier(); ok {
+			pi.AppIdentifier = show(app)
+		}
 		d.Profiles = append(d.Profiles, pi)
 	}
 	if len(res.Profiles) > 0 {
@@ -414,9 +423,11 @@ func runDoctor(ctx context.Context, env Env, args []string) (result, error) {
 		}
 	} else {
 		d.Fingerprint = digest
-		known, err := doctor.LoadKnown(h.Paths.StateDir())
-		if err != nil {
-			return result{}, err
+		// An unreadable known-good set fails FP (fail closed) without hiding
+		// the other checks; an accept replaces it.
+		known, knownErr := doctor.LoadKnown(h.Paths.StateDir())
+		if knownErr != nil {
+			known = doctor.Known{}
 		}
 		if *accept && !known.Contains(digest) {
 			switch {
@@ -425,6 +436,9 @@ func runDoctor(ctx context.Context, env Env, args []string) (result, error) {
 			case probe.Failed(d.Checks):
 				d.AcceptRefused = "another check failed; a fingerprint is accepted only when every other check passes"
 			default:
+				if err := guardStateDir(env); err != nil {
+					return result{}, err
+				}
 				version, _ := h.Prefs.AppVersion()
 				known.Accepted = append(known.Accepted, doctor.Accepted{Digest: digest, AppVersion: version, AcceptedAt: now(h), Schema: schema})
 				if err := doctor.SaveKnown(h.Paths.StateDir(), known); err != nil {
@@ -433,7 +447,12 @@ func runDoctor(ctx context.Context, env Env, args []string) (result, error) {
 				d.Accepted = true
 			}
 		}
-		d.Checks = append(d.Checks, probe.RunAll(ctx, []probe.Probe{doctor.Fingerprint(schema, digest, known)}, probe.ReadOnly)...)
+		if knownErr != nil && !d.Accepted {
+			d.Checks = append(d.Checks, probe.Result{ID: "FP", Contract: "C", Tier: probe.ReadOnly.String(), Status: probe.Fail,
+				Detail: "the known-good fingerprint set cannot be read: " + knownErr.Error() + "; review, then run `schrodeck doctor --accept-fingerprint` to replace it"})
+		} else {
+			d.Checks = append(d.Checks, probe.RunAll(ctx, []probe.Probe{doctor.Fingerprint(schema, digest, known)}, probe.ReadOnly)...)
+		}
 	}
 
 	var text strings.Builder

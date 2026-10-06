@@ -20,8 +20,11 @@ import (
 	"time"
 
 	"github.com/csmarshall/schrodeck/deckformat/fixture"
+	"github.com/csmarshall/schrodeck/deckformat/jsondoc"
+	"github.com/csmarshall/schrodeck/deckformat/observe"
 	"github.com/csmarshall/schrodeck/deckformat/profile"
 	"github.com/csmarshall/schrodeck/internal/decks"
+	"github.com/csmarshall/schrodeck/internal/doctor"
 	"github.com/csmarshall/schrodeck/internal/host"
 	"github.com/csmarshall/schrodeck/internal/ports"
 	"github.com/csmarshall/schrodeck/internal/ports/fake"
@@ -613,5 +616,229 @@ func TestObserveRedactsADeckPresentOnlyBefore(t *testing.T) {
 	}
 	if strings.Contains(strings.ToUpper(out.String()), gone) {
 		t.Fatalf("the report shows the unplugged deck's serial:\n%s", out.String())
+	}
+}
+
+// brokenPrefs fails every device-record read, as a prefs read can at any time.
+type brokenPrefs struct{ fake.Prefs }
+
+func (brokenPrefs) DeviceRecords() ([]map[string]any, error) {
+	return nil, errors.New("fake prefs: unreadable")
+}
+
+func TestReportRedactorUsesBothSnapshots(t *testing.T) {
+	h := fakeHost(t)
+	beforeOnly, afterOnly := "BB11"+"CC22", "DD33"+"EE44"
+	snap := func(serial string) *observe.Snapshot {
+		prefs, err := jsondoc.FromAny(map[string]any{"Devices": map[string]any{"@(1)[4057/99/" + serial + "]": map[string]any{}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &observe.Snapshot{Profiles: map[string]*profile.Profile{}, Prefs: prefs}
+	}
+	// The host cannot be read again, so only the snapshots can supply serials.
+	h.Prefs = brokenPrefs{h.Prefs.(fake.Prefs)}
+	env, _, _ := testEnv(nil, h)
+	r, err := reportRedactor(env, snap(beforeOnly), snap(afterOnly))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range []string{beforeOnly, afterOnly} {
+		if got := r.String("bare " + s); strings.Contains(got, s) {
+			t.Errorf("serial %s left in %q", s, got)
+		}
+	}
+}
+
+func TestObserveRedactsADeckPresentOnlyAfter(t *testing.T) {
+	h := fakeHost(t)
+	env, _, _ := testEnv(nil, h)
+	if code := Run(context.Background(), []string{"observe", "start", "u0-plug"}, env); code != ExitOK {
+		t.Fatal("start failed")
+	}
+	added := "FF55" + "GG66"
+	prefs := h.Prefs.(fake.Prefs)
+	prefs.Records = append(append([]map[string]any{}, prefs.Records...), map[string]any{decks.RecordKey: "@(1)[4057/99/" + added + "]", "Serial": added})
+	h.Prefs = prefs
+	env, out, errb := testEnv(nil, h)
+	if code := Run(context.Background(), []string{"observe", "stop", "u0-plug"}, env); code != ExitOK {
+		t.Fatalf("stop: exit %d %s", code, errb.String())
+	}
+	if !strings.Contains(out.String(), "Serial | added") {
+		t.Fatalf("the plugged-in deck's record is not in the report:\n%s", out.String())
+	}
+	if strings.Contains(strings.ToUpper(out.String()), added) {
+		t.Fatalf("the report shows the new deck's serial:\n%s", out.String())
+	}
+}
+
+func TestInventoryRedactsAppIdentifier(t *testing.T) {
+	h := fakeHost(t)
+	manifest := filepath.Join(h.Paths.ProfilesDir(), fixture.XL().Folder(), "manifest.json")
+	b, _ := os.ReadFile(manifest)
+	app := "/Users/" + "alice" + "/Applications/Tool.app"
+	if err := os.WriteFile(manifest, bytes.Replace(b, []byte(`"Name":`), []byte(`"AppIdentifier":"`+app+`","Name":`), 1), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	env, out, _ := testEnv(nil, h)
+	Run(context.Background(), []string{"inventory", "--json"}, env)
+	if !strings.Contains(out.String(), `"app_identifier":"/Users/<user>/Applications/Tool.app"`) {
+		t.Fatalf("app_identifier not redacted:\n%s", out.String())
+	}
+}
+
+func TestWrittenPathsAreRedacted(t *testing.T) {
+	h := fakeHost(t)
+	env, _, _ := testEnv(nil, h)
+	if code := Run(context.Background(), []string{"observe", "start", "u0-path"}, env); code != ExitOK {
+		t.Fatal("start failed")
+	}
+	base := t.TempDir()
+	env, out, errb := testEnv(nil, h)
+	if code := Run(context.Background(), []string{"observe", "stop", "u0-path", "--json", "--out", filepath.Join(base, "alice-notes", "r.md")}, env); code != ExitOK {
+		t.Fatalf("stop: exit %d %s", code, errb.String())
+	}
+	if strings.Contains(out.String(), "alice") || !strings.Contains(out.String(), "<user>-notes") {
+		t.Fatalf("observe written path not redacted:\n%s", out.String())
+	}
+	env, out, errb = testEnv(nil, h)
+	if code := Run(context.Background(), []string{"fixture", "export", "--json", "--profile", fixture.XL().Folder(), "--out", filepath.Join(base, "alice-fx")}, env); code != ExitOK {
+		t.Fatalf("fixture: exit %d %s", code, errb.String())
+	}
+	if strings.Contains(out.String(), "alice") || !strings.Contains(out.String(), "<user>-fx") {
+		t.Fatalf("fixture out path not redacted:\n%s", out.String())
+	}
+}
+
+// lockObserveDir makes the observe/ dir unwritable so its entries cannot be
+// removed, and restores it at cleanup.
+func lockObserveDir(t *testing.T, h *host.Host) {
+	t.Helper()
+	dir := filepath.Join(h.Paths.StateDir(), "observe")
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(dir, 0o700) })
+	if f, err := os.Create(filepath.Join(dir, "probe")); err == nil {
+		f.Close()
+		t.Skip("cannot make a directory unwritable here (running as root?)")
+	}
+}
+
+func TestObserveStopReportsSnapshotsItCouldNotDelete(t *testing.T) {
+	// Success path: the report went out, so exit 0, with a warning naming
+	// where the raw snapshots remain.
+	h := fakeHost(t)
+	env, _, _ := testEnv(nil, h)
+	if code := Run(context.Background(), []string{"observe", "start", "u0-stuck"}, env); code != ExitOK {
+		t.Fatal("start failed")
+	}
+	lockObserveDir(t, h)
+	env, _, errb := testEnv(nil, h)
+	if code := Run(context.Background(), []string{"observe", "stop", "u0-stuck"}, env); code != ExitOK {
+		t.Fatalf("stop: exit %d %s", code, errb.String())
+	}
+	want := "unredacted snapshots remain in " + filepath.Join(h.Paths.StateDir(), "observe", "u0-stuck")
+	if !strings.Contains(errb.String(), want) {
+		t.Fatalf("no warning about the leftover snapshots: %q", errb.String())
+	}
+	// Failure path: both the failure and the removal error are reported.
+	h = fakeHost(t)
+	env, _, _ = testEnv(nil, h)
+	if code := Run(context.Background(), []string{"observe", "start", "u0-stuck"}, env); code != ExitOK {
+		t.Fatal("start failed")
+	}
+	manifest := filepath.Join(h.Paths.ProfilesDir(), fixture.XL().Folder(), "manifest.json")
+	if err := os.WriteFile(manifest, []byte(`{"Name":"Fixture XL","Version":"3.0"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	lockObserveDir(t, h)
+	env, _, errb = testEnv(nil, h)
+	if code := Run(context.Background(), []string{"observe", "stop", "u0-stuck"}, env); code != ExitFail {
+		t.Fatalf("stop: exit %d", code)
+	}
+	if !strings.Contains(errb.String(), "Pages") || !strings.Contains(errb.String(), "could not be deleted, remove "+filepath.Join(h.Paths.StateDir(), "observe", "u0-stuck")) {
+		t.Fatalf("stderr lacks the failure or the removal error: %q", errb.String())
+	}
+}
+
+// insideState puts schrodeck's state dir inside the app data root.
+type insideState struct{ fake.Paths }
+
+func (p insideState) StateDir() string { return filepath.Join(p.AppDataRoot(), "schrodeck") }
+
+func TestStateDirInsideAppDataIsRefused(t *testing.T) {
+	h := fakeHost(t)
+	h.Paths = insideState{h.Paths.(fake.Paths)}
+	env, out, _ := testEnv(nil, h)
+	if code := Run(context.Background(), []string{"doctor", "--accept-fingerprint", "--json"}, env); code != ExitFail {
+		t.Fatalf("doctor --accept-fingerprint: exit %d\n%s", code, out.String())
+	}
+	env, _, errb := testEnv(nil, h)
+	if code := Run(context.Background(), []string{"observe", "start", "u0-state"}, env); code != ExitFail || !strings.Contains(errb.String(), "state dir is refused") {
+		t.Fatalf("observe start: exit %d %q", code, errb.String())
+	}
+	if _, err := os.Stat(h.Paths.StateDir()); !os.IsNotExist(err) {
+		t.Fatal("schrodeck wrote state inside the app's data")
+	}
+}
+
+func TestAcceptRefusedWhenAnotherCheckFailsWithEveryProfileLoaded(t *testing.T) {
+	h := fakeHost(t)
+	prefs := h.Prefs.(fake.Prefs)
+	prefs.Version = "" // M5 fails; every profile still loads
+	h.Prefs = prefs
+	env, out, _ := testEnv(nil, h)
+	if code := Run(context.Background(), []string{"doctor", "--accept-fingerprint", "--json"}, env); code != ExitFail {
+		t.Fatalf("exit %d", code)
+	}
+	if !strings.Contains(out.String(), `"accept_refused":"another check failed`) {
+		t.Fatalf("accept not refused for a failing M5:\n%s", out.String())
+	}
+	if _, err := os.Stat(filepath.Join(h.Paths.StateDir(), doctor.KnownFile)); !os.IsNotExist(err) {
+		t.Fatal("a refused accept wrote the known-good set")
+	}
+}
+
+func TestObserveSettleStopsOnInterrupt(t *testing.T) {
+	h := fakeHost(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sleeps := 0
+	h.Sleep = func(time.Duration) { sleeps++; cancel() } // Ctrl-C during the first wait
+	env, _, errb := testEnv(nil, h)
+	if code := Run(ctx, []string{"observe", "start", "u0-int"}, env); code != ExitFail || !strings.Contains(errb.String(), "context canceled") {
+		t.Fatalf("interrupted start: exit %d %q", code, errb.String())
+	}
+	if sleeps != 1 {
+		t.Fatalf("settle waited %d times after the interrupt", sleeps)
+	}
+	if _, err := os.Stat(filepath.Join(h.Paths.StateDir(), "observe", "u0-int")); !os.IsNotExist(err) {
+		t.Fatal("an interrupted start saved a snapshot")
+	}
+}
+
+func TestCorruptKnownSetFailsFPAndCanBeReplaced(t *testing.T) {
+	h := fakeHost(t)
+	if err := os.MkdirAll(h.Paths.StateDir(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(h.Paths.StateDir(), doctor.KnownFile), []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	env, out, _ := testEnv(nil, h)
+	if code := Run(context.Background(), []string{"doctor", "--json"}, env); code != ExitFail {
+		t.Fatalf("exit %d", code)
+	}
+	if !strings.Contains(out.String(), `"id":"P1"`) || !strings.Contains(out.String(), `"id":"FP","contract":"C","tier":"read-only","status":"fail","detail":"the known-good fingerprint set cannot be read`) {
+		t.Fatalf("corrupt known set did not fail FP alongside the other checks:\n%s", out.String())
+	}
+	env, out, _ = testEnv(nil, h)
+	if code := Run(context.Background(), []string{"doctor", "--accept-fingerprint", "--json"}, env); code != ExitOK {
+		t.Fatalf("accept over a corrupt set: exit %d\n%s", code, out.String())
+	}
+	env, _, _ = testEnv(nil, h)
+	if code := Run(context.Background(), []string{"doctor"}, env); code != ExitOK {
+		t.Fatal("doctor still fails after the corrupt set was replaced")
 	}
 }

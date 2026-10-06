@@ -43,9 +43,14 @@ func observeDir(env Env, name string) string {
 // keeps them, so a report row's path names the device rather than a list
 // index that shifts when a deck is added. Profiles that failed to load during
 // the deck read are kept with the snapshot's own load errors.
-func snapshot(env Env) (*observe.Snapshot, error) {
+func snapshot(ctx context.Context, env Env) (*observe.Snapshot, error) {
 	h := env.Host
 	take := func() (*observe.Snapshot, error) {
+		// Checked before every try, so an interrupt (Ctrl-C) during settling
+		// stops at the next snapshot instead of after all of them.
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		var prefs *jsondoc.Value
 		if recs, err := h.Prefs.DeviceRecords(); err == nil {
 			devices := map[string]any{}
@@ -70,7 +75,12 @@ func snapshot(env Env) (*observe.Snapshot, error) {
 	if sleep == nil {
 		sleep = time.Sleep
 	}
-	return observe.Settle(take, func() { sleep(settleInterval) }, settleTries)
+	wait := func() {
+		if ctx.Err() == nil {
+			sleep(settleInterval)
+		}
+	}
+	return observe.Settle(take, wait, settleTries)
 }
 
 // snapshotDeviceIDs lists the device ids a snapshot holds: each profile's
@@ -111,6 +121,23 @@ func mergeSnapshotLoadErrors(have []observe.LoadError, more []error) []observe.L
 	return have
 }
 
+// guardStateDir refuses a state dir that resolves inside the app's data
+// (a misconfigured connector or a symlink): schrodeck's own writes and
+// deletions there would land in the app's files.
+func guardStateDir(env Env) error {
+	if err := pathguard.RefuseInside(env.Host.Paths.StateDir(), protectedRoots(env)...); err != nil {
+		return fmt.Errorf("schrodeck's state dir is refused: %w", err)
+	}
+	return nil
+}
+
+// reportRedactor is the one redactor for an observation report. Its serials
+// come from the two snapshots being reported, not from a fresh read of the
+// host: a read that fails or differs must not let an id through.
+func reportRedactor(env Env, before, after *observe.Snapshot) (*redact.Redactor, error) {
+	return redactorFor(env, append(snapshotDeviceIDs(before), snapshotDeviceIDs(after)...))
+}
+
 // protectedRoots are the directories M1 never writes: the app data root and
 // the profiles directory, both, in case a connector places them apart.
 func protectedRoots(env Env) []string {
@@ -134,7 +161,7 @@ type observeData struct {
 	Written  string          `json:"written,omitempty"`
 }
 
-func runObserve(_ context.Context, env Env, args []string) (res result, err error) {
+func runObserve(ctx context.Context, env Env, args []string) (res result, err error) {
 	fs := newFlags("observe")
 	out := fs.String("out", "", "stop: also write the Markdown report to this file")
 	rest, err := parseFlags(fs, env, args)
@@ -164,13 +191,16 @@ func runObserve(_ context.Context, env Env, args []string) (res result, err erro
 			return result{}, usageError{fmt.Sprintf("--out %s already exists; reports are never overwritten", *out)}
 		}
 	}
+	if err := guardStateDir(env); err != nil {
+		return result{}, err
+	}
 	dir := observeDir(env, name)
 
 	if verb == "start" {
 		if _, err := os.Stat(dir); err == nil {
 			return result{}, fmt.Errorf("observation %q is already started; run `schrodeck observe stop %s` first", name, name)
 		}
-		s, err := snapshot(env)
+		s, err := snapshot(ctx, env)
 		if err != nil {
 			return result{}, err
 		}
@@ -189,21 +219,28 @@ func runObserve(_ context.Context, env Env, args []string) (res result, err erro
 	// every path, failures included: a stop that cannot report still must not
 	// leave the raw copy behind. Start the observation again to retry.
 	defer func() {
-		if rmErr := os.RemoveAll(dir); rmErr != nil && err == nil {
-			res, err = result{}, rmErr
+		rmErr := os.RemoveAll(dir)
+		switch {
+		case rmErr == nil:
+		case err != nil:
+			err = errors.Join(err, fmt.Errorf("the unredacted snapshots could not be deleted, remove %s by hand: %w", dir, rmErr))
+		default:
+			// The report is already out, so the command succeeded; the leftover
+			// raw copy is said loudly instead.
+			fmt.Fprintf(env.Stderr, "schrodeck observe: warning: the unredacted snapshots remain in %s and could not be deleted (%v); remove them by hand\n", dir, rmErr)
 		}
 	}()
 	before, err := observe.Load(filepath.Join(dir, "before"))
 	if err != nil {
 		return result{}, fmt.Errorf("observation %q: the start snapshot does not load: %w", name, err)
 	}
-	after, err := snapshot(env)
+	after, err := snapshot(ctx, env)
 	if err != nil {
 		return result{}, err
 	}
 	// One redactor for the whole report, knowing the device ids of both
-	// snapshots, so a deck present only before the action is redacted too.
-	r, err := redactor(env, snapshotDeviceIDs(before)...)
+	// snapshots, so a deck present on only one side is redacted too.
+	r, err := reportRedactor(env, before, after)
 	if err != nil {
 		return result{}, err
 	}
@@ -218,7 +255,7 @@ func runObserve(_ context.Context, env Env, args []string) (res result, err erro
 		if err != nil {
 			return result{}, err
 		}
-		d.Written = written
+		d.Written = r.String(written)
 	}
 	return result{data: d, text: md}, nil
 }
@@ -299,9 +336,9 @@ func runFixture(_ context.Context, env Env, args []string) (result, error) {
 	}
 	strs := redact.Strings(exported)
 	var text strings.Builder
-	fmt.Fprintf(&text, "Wrote %s. Review every string below before committing it; the leak scan is a second line of defense, not the first:\n", written)
+	fmt.Fprintf(&text, "Wrote %s. Review every string below before committing it; the leak scan is a second line of defense, not the first:\n", r.String(written))
 	for _, s := range strs {
 		fmt.Fprintf(&text, "  %q\n", s)
 	}
-	return result{data: fixtureData{Folder: filepath.Base(written), Out: filepath.Dir(written), Strings: strs}, text: text.String()}, nil
+	return result{data: fixtureData{Folder: filepath.Base(written), Out: r.String(filepath.Dir(written)), Strings: strs}, text: text.String()}, nil
 }
