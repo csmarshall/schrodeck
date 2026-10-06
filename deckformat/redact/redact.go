@@ -552,7 +552,8 @@ var ErrOutputExists = errors.New("redact: output directory is not empty")
 // empty or absent (a directory that cannot be listed is refused, not assumed
 // empty), and the final target must not lie inside any of roots (the folder p
 // was read from, the app's data root), so an export can never write into the
-// app's own data. It returns the absolute path of the profile folder it wrote,
+// app's own data. No roots, or an empty root, is refused with
+// pathguard.ErrNoRoots before anything is read or written. It returns the absolute path of the profile folder it wrote,
 // which differs from outDir/folder when the folder name carried a UUID that was
 // pseudonymized. Every file is created exclusively (O_EXCL), so an existing
 // file, including a hard link to another file, is never opened for writing.
@@ -564,6 +565,11 @@ var ErrOutputExists = errors.New("redact: output directory is not empty")
 // outDir between the guard and the open. The identity re-check after the open
 // narrows that window; it does not remove it.
 func ExportFixture(p *profile.Profile, r *Redactor, outDir, folder string, roots ...string) (string, error) {
+	// RefuseInside below refuses missing roots too; checking first keeps the
+	// refusal independent of how far the export gets.
+	if err := pathguard.RefuseInside(outDir, roots...); errors.Is(err, pathguard.ErrNoRoots) {
+		return "", err
+	}
 	if err := pathguard.SingleName(folder); err != nil {
 		return "", err
 	}

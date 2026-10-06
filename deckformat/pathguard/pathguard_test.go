@@ -61,7 +61,7 @@ func TestRefuseInside(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, c := range cases {
-		err := RefuseInside(c.target, "", root)
+		err := RefuseInside(c.target, root)
 		if got := errors.Is(err, ErrInside); got != c.inside {
 			t.Errorf("RefuseInside(%s) = %v, want inside=%v", c.target, err, c.inside)
 		}
@@ -358,4 +358,43 @@ func TestCreate(t *testing.T) {
 			t.Fatalf("err = %v, want ErrInside", err)
 		}
 	})
+}
+
+// I6b: a guard with nothing to guard is a caller bug (an unset data root), so
+// it refuses instead of allowing every target.
+func TestNoRootsFailsClosed(t *testing.T) {
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(base, "app")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(base, "out", "x.txt")
+	for name, roots := range map[string][]string{
+		"no roots":           nil,
+		"only an empty root": {""},
+		"an empty root too":  {root, ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := RefuseInside(target, roots...); !errors.Is(err, ErrNoRoots) {
+				t.Errorf("RefuseInside with roots %q = %v, want ErrNoRoots", roots, err)
+			}
+			f, _, err := Create(target, roots...)
+			if f != nil {
+				f.Close()
+			}
+			if !errors.Is(err, ErrNoRoots) {
+				t.Errorf("Create with roots %q = %v, want ErrNoRoots", roots, err)
+			}
+			if _, err := os.Lstat(target); !errors.Is(err, fs.ErrNotExist) {
+				t.Errorf("Create with roots %q wrote %s: %v", roots, target, err)
+			}
+		})
+	}
+	// Known-good control: the same target with a real root is allowed.
+	if err := RefuseInside(target, root); err != nil {
+		t.Fatalf("control: RefuseInside with a real root = %v", err)
+	}
 }
