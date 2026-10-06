@@ -23,6 +23,9 @@ import (
 // app's prefs Devices dictionary (contract A, AppPrefs.DeviceRecords).
 const RecordKey = "_key"
 
+// VirtualKey is the device key every virtual deck shares (R12).
+const VirtualKey = "@(0)[]"
+
 // RecordRaw marks a Devices entry that is not a device record (observed: one
 // string-valued entry); its value is kept under this member for observation.
 const RecordRaw = "_raw"
@@ -114,17 +117,20 @@ func Validate(types map[int]TypeInfo, products map[[2]int]int) error {
 
 var physicalKey = regexp.MustCompile(`^@\((\d+)\)\[(\d+)/(\d+)/([^\]]*)\]$`)
 
-// ParseKey splits a device key. Virtual decks are "@(0)[]" (R12).
+// ParseKey splits a device key. Virtual decks are "@(0)[]" (R12). A physical key needs numeric vendor and product and a non-empty serial.
 func ParseKey(key string) (virtual bool, vendor, product int, serial string, ok bool) {
-	if key == "@(0)[]" {
+	if key == VirtualKey {
 		return true, 0, 0, "", true
 	}
 	m := physicalKey.FindStringSubmatch(key)
 	if m == nil {
 		return false, 0, 0, "", false
 	}
-	vendor, _ = strconv.Atoi(m[2])
-	product, _ = strconv.Atoi(m[3])
+	vendor, errV := strconv.Atoi(m[2])
+	product, errP := strconv.Atoi(m[3])
+	if errV != nil || errP != nil || m[4] == "" {
+		return false, 0, 0, "", false
+	}
 	return false, vendor, product, m[4], true
 }
 
@@ -166,7 +172,8 @@ type Status struct {
 	ports.Deck
 	GeometryKnown bool
 	// KeyUnique: only a deck whose key is unique on this host can be a
-	// destination (ADR 0026, review F31).
+	// destination (ADR 0026, review F31). The shared virtual key is never
+	// unique until U5 is observed.
 	KeyUnique bool
 }
 
@@ -179,9 +186,13 @@ func Annotate(ds []ports.Deck) []Status {
 	for _, d := range ds {
 		count[d.AppDeviceID]++
 	}
+	// The prefs Devices dictionary is keyed, so N virtual decks sharing the
+	// key "@(0)[]" collapse into one record and look unique. Whether they do
+	// collapse is observation U5; until it is settled the shared virtual key is
+	// never unique, so such a deck is never a destination.
 	out := make([]Status, 0, len(ds))
 	for _, d := range ds {
-		out = append(out, Status{Deck: d, GeometryKnown: d.Geometry.Columns > 0 && d.Geometry.Rows > 0, KeyUnique: count[d.AppDeviceID] == 1})
+		out = append(out, Status{Deck: d, GeometryKnown: d.Geometry.Columns > 0 && d.Geometry.Rows > 0, KeyUnique: d.AppDeviceID != VirtualKey && count[d.AppDeviceID] == 1})
 	}
 	return out
 }

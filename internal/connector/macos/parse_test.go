@@ -10,8 +10,11 @@ import (
 
 	"howett.net/plist"
 
+	"github.com/csmarshall/schrodeck/deckformat/fixture"
 	"github.com/csmarshall/schrodeck/deckformat/jsondoc"
+	"github.com/csmarshall/schrodeck/deckformat/profile"
 	"github.com/csmarshall/schrodeck/internal/decks"
+	"github.com/csmarshall/schrodeck/internal/ports"
 )
 
 func TestParseIOPlatformUUID(t *testing.T) {
@@ -121,4 +124,54 @@ func strIs(v *jsondoc.Value, want string) bool {
 	}
 	s, ok := v.Str()
 	return ok && s == want
+}
+
+// End to end through the connector's own path: two profiles bound to the shared
+// virtual key arrive as ONE prefs record, which must still not be a destination
+// (U5), even if a virtual geometry were known.
+func TestSharedVirtualKeyThroughPrefsIsNeverADestination(t *testing.T) {
+	raw, err := plist.Marshal(map[string]any{"Devices": map[string]any{decks.VirtualKey: map[string]any{"DeviceName": ""}}}, plist.XMLFormat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var prefs map[string]any
+	if _, err := plist.Unmarshal(raw, &prefs); err != nil {
+		t.Fatal(err)
+	}
+	a := fixture.XL()
+	a.Device = decks.VirtualKey
+	b := fixture.CopyOf(a, "second")
+	var profs []*profile.Profile
+	for _, fx := range []fixture.Profile{a, b} {
+		p, err := profile.Load(fx.FS(), fx.Folder())
+		if err != nil {
+			t.Fatal(err)
+		}
+		profs = append(profs, p)
+	}
+	recs, err := DeviceRecords(prefs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ds := decks.Enumerate(recs, profs, nil)
+	if len(ds) != 1 || !ds[0].Virtual {
+		t.Fatalf("decks = %+v", ds)
+	}
+	ds[0].Geometry = ports.Geometry{Columns: 8, Rows: 4}
+	st := decks.Annotate(ds)
+	if !st[0].GeometryKnown || st[0].Destination() {
+		t.Fatalf("shared virtual key became a destination: %+v", st[0])
+	}
+}
+
+// `defaults export` of a domain with no keys prints an empty dict; that is an
+// error about missing Devices, not a crash or an empty deck list.
+func TestEmptyPrefsDictHasNoDevices(t *testing.T) {
+	var prefs map[string]any
+	if _, err := plist.Unmarshal([]byte(`<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict/></plist>`), &prefs); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DeviceRecords(prefs); err == nil {
+		t.Fatal("empty prefs accepted")
+	}
 }

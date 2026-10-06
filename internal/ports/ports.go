@@ -53,7 +53,8 @@ type Deck struct {
 	Geometry         Geometry
 	Model            string
 	Virtual          bool
-	SerialHash       string
+	// SerialHash is derived from the deck's serial: treat it as an identifier (never log, print or commit it), not as a harmless digest.
+	SerialHash string
 }
 
 // DeviceEnumerator lists this host's decks from the app's own data.

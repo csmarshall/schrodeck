@@ -20,7 +20,7 @@ func TestParseKey(t *testing.T) {
 	if v, _, _, _, ok := ParseKey("@(0)[]"); !ok || !v {
 		t.Fatal("virtual deck not recognized")
 	}
-	for _, bad := range []string{"", "Devices", "@(1)[4057/143]", "x@(1)[1/2/3]"} {
+	for _, bad := range []string{"", "Devices", "@(1)[4057/143]", "x@(1)[1/2/3]", "@(1)[4057/143/]", "@(1)[99999999999999999999/1/<deck>]", "@(1)[1/99999999999999999999/<deck>]"} {
 		if _, _, _, _, ok := ParseKey(bad); ok {
 			t.Errorf("ParseKey(%q) accepted", bad)
 		}
@@ -134,5 +134,27 @@ func TestKeyed(t *testing.T) {
 	}
 	if len(Keyed(nil)) != 0 {
 		t.Error("nil records must give an empty object")
+	}
+}
+
+// A record with no profile bound to it is still a deck, just one without a
+// manifest id or model.
+func TestEnumerateDeckWithoutProfile(t *testing.T) {
+	known := map[[2]int]ports.Geometry{{4057, 143}: {Columns: 8, Rows: 4}}
+	got := Enumerate([]map[string]any{{RecordKey: fixture.Device}}, nil, known)
+	if len(got) != 1 || got[0].ManifestDeviceID != "" || got[0].Model != "" || got[0].AppDeviceID != fixture.Device {
+		t.Fatalf("got %+v", got)
+	}
+	if st := Annotate(got); !st[0].Destination() {
+		t.Errorf("a known-geometry unique deck without a profile should still be a destination: %+v", st[0])
+	}
+}
+
+// Review F31 / U5: a shared virtual key is never unique, even when it appears
+// once (the prefs dictionary collapses N virtual decks into one record).
+func TestVirtualKeyIsNeverUnique(t *testing.T) {
+	d := ports.Deck{AppDeviceID: VirtualKey, Virtual: true, Geometry: ports.Geometry{Columns: 8, Rows: 4}}
+	if st := Annotate([]ports.Deck{d}); st[0].KeyUnique || st[0].Destination() {
+		t.Fatalf("a lone virtual deck must not be a destination: %+v", st[0])
 	}
 }

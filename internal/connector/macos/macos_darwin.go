@@ -186,13 +186,22 @@ func (c *Connector) DeviceRecords() ([]map[string]any, error) {
 }
 
 func (c *Connector) Decks() ([]ports.Deck, error) {
+	ds, _, err := c.DecksWithLoadErrors()
+	return ds, err
+}
+
+// DecksWithLoadErrors is Decks plus one *profile.FolderError per profile folder
+// that failed to load. Such a profile cannot be matched to a deck, so callers
+// that report on the host (observe, doctor) should show these rather than let
+// the deck look unbound.
+func (c *Connector) DecksWithLoadErrors() ([]ports.Deck, []error, error) {
 	recs, err := c.DeviceRecords()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	res, err := profile.LoadAll(os.DirFS(c.ProfilesDir()))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return decks.Enumerate(recs, res.Profiles, decks.KnownGeometry()), nil
+	return decks.Enumerate(recs, res.Profiles, decks.KnownGeometry()), res.Errors, nil
 }

@@ -65,8 +65,6 @@ func TestPaths(t *testing.T) {
 	}
 }
 
-// Read-only checks against the real app; skipped where it is not installed
-// (CI runners).
 // liveEnv opts in to tests that read this Mac's real Stream Deck install
 // (read-only). They are off by default so `go test ./...` on a development
 // Mac never touches a personal install unless asked to.
