@@ -6,6 +6,7 @@ package observe
 
 import (
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -107,7 +108,7 @@ func TestCompareReportsAndRedacts(t *testing.T) {
 	for _, want := range []string{
 		"# Observation: u0-title",
 		"Titles, page names and setting values are shown as-is; review before committing.",
-		"page 1 (profile-1/page/0) › key 1,0",
+		"profile-1/page/0 › key 1,0",
 		`"Paste"`,
 		"@(1)[4057/143/<deck>]",
 		"| R?? | <topic> | **Observed** | `schrodeck observe u0-title`, app 7.5.1, 2026-10-02 |",
@@ -581,5 +582,347 @@ func TestSameSlotOnAnotherPageCannotUnblankASecret(t *testing.T) {
 				t.Errorf("secret leaked in %d of %d runs", leaks, runs)
 			}
 		})
+	}
+}
+
+// compare is Take + Compare for fixture file systems, returning the Markdown
+// report (which includes the evidence row).
+func compare(t *testing.T, before, after fstest.MapFS) (Report, string) {
+	t.Helper()
+	b, err := Take(before, nil, "7.5.1", t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := Take(after, nil, "7.5.1", t0.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rep, err := Compare("t", b, a, redactor(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rep, rep.Markdown()
+}
+
+// rawDiff is the unredacted, unpseudonymized change list: the known-bad
+// control for every leak assertion.
+func rawDiff(t *testing.T, before, after fstest.MapFS) string {
+	t.Helper()
+	b, err := Take(before, nil, "7.5.1", t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := Take(after, nil, "7.5.1", t0.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := semdiff.Sets(b.Profiles, a.Profiles, semdiff.Raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sb strings.Builder
+	for _, c := range raw {
+		sb.WriteString(c.String() + "\n")
+	}
+	return sb.String()
+}
+
+func TestSettleNeedsTwoTries(t *testing.T) {
+	s := take(t, fixture.XL(), nil, t0)
+	for _, n := range []int{-1, 0, 1} {
+		calls := 0
+		_, err := Settle(func() (*Snapshot, error) { calls++; return s, nil }, func() {}, n)
+		if err == nil || !strings.Contains(err.Error(), "at least 2") {
+			t.Errorf("Settle with maxTries %d = %v, want an \"at least 2\" error", n, err)
+		}
+		if calls != 0 {
+			t.Errorf("Settle with maxTries %d took %d snapshot(s) before refusing", n, calls)
+		}
+	}
+	// Known-good control: two identical snapshots settle at maxTries 2.
+	if _, err := Settle(func() (*Snapshot, error) { return s, nil }, func() {}, 2); err != nil {
+		t.Fatalf("control: Settle with maxTries 2 = %v", err)
+	}
+}
+
+// C1: no two ids may share a pseudonym, whatever pages appear, move or vanish.
+func TestPagePseudonymsAreInjective(t *testing.T) {
+	addThenSwap := func() (fixture.Profile, fixture.Profile) {
+		before := fixture.XL()
+		before.Pages = before.Pages[:1]
+		after := fixture.XL()
+		after.Pages = []fixture.Page{after.Pages[1], after.Pages[0]} // the new page now sits at index 0
+		return before, after
+	}
+	replacePage0 := func() (fixture.Profile, fixture.Profile) {
+		before, after := fixture.XL(), fixture.XL()
+		after.Pages[0] = fixture.Page{ID: "bbbbbbbb-0000-4000-8000-0000000000b1"}
+		return before, after
+	}
+	orphanSubPages := func() (fixture.Profile, fixture.Profile) {
+		// Pages listed nowhere are sub-pages; one exists only before, one only after.
+		before, after := fixture.XL(), fixture.XL()
+		return before, after
+	}
+	for _, tc := range []struct {
+		name   string
+		build  func() (fixture.Profile, fixture.Profile)
+		extraB map[string]string // page folder id → only before
+		extraA map[string]string // page folder id → only after
+		newID  string            // a page present only after
+	}{
+		{name: "add then swap", build: addThenSwap, newID: "aaaaaaaa-0000-4000-8000-0000000000a2"},
+		{name: "replace page 0", build: replacePage0, newID: "bbbbbbbb-0000-4000-8000-0000000000b1"},
+		{name: "sub-pages on each side", build: orphanSubPages,
+			extraB: map[string]string{"cccccccc-0000-4000-8000-0000000000c1": "before"},
+			extraA: map[string]string{"cccccccc-0000-4000-8000-0000000000c2": "after"},
+			newID:  "cccccccc-0000-4000-8000-0000000000c2"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bp, ap := tc.build()
+			bfs, afs := bp.FS(), ap.FS()
+			addPage := func(fsys fstest.MapFS, folder string, ids map[string]string) {
+				for id := range ids {
+					fsys[folder+"/Profiles/"+fixture.PageFolder(id)+"/manifest.json"] = &fstest.MapFile{Data: []byte(`{"Controllers":[],"Icon":"","Name":""}`)}
+				}
+			}
+			addPage(bfs, bp.Folder(), tc.extraB)
+			addPage(afs, ap.Folder(), tc.extraA)
+			b, err := Take(bfs, nil, "7.5.1", t0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			a, err := Take(afs, nil, "7.5.1", t0.Add(time.Minute))
+			if err != nil {
+				t.Fatal(err)
+			}
+			ps := newPseudonyms(b, a)
+			owner := map[string]string{}
+			for id, name := range ps.names {
+				if other, dup := owner[name]; dup {
+					t.Errorf("%s and %s share the pseudonym %q", id, other, name)
+				}
+				owner[name] = id
+			}
+			if got := ps.names[tc.newID]; !strings.HasPrefix(got, "profile-1/new-page-") {
+				t.Errorf("page present only after is named %q, want profile-1/new-page-K", got)
+			}
+			rep, err := Compare("t", b, a, redactor(t))
+			if err != nil {
+				t.Fatal(err)
+			}
+			md := rep.Markdown()
+			for _, c := range rep.Changes {
+				if c.Kind == semdiff.Modified && c.Before == c.After {
+					t.Errorf("a modified row shows the same value on both sides: %+v", c)
+				}
+				// Minor 7: Where names the page by its pseudonym only.
+				if strings.Contains(c.Where, "page ") && strings.Contains(c.Where, "(") {
+					t.Errorf("Where mixes a position number with a pseudonym: %q", c.Where)
+				}
+			}
+			if strings.Contains(md, "sub-page profile-") {
+				t.Errorf("report carries a doubled sub-page label:\n%s", md)
+			}
+		})
+	}
+}
+
+// I2: an added profile is diffed against an empty one, so its content is
+// reported row by row through the redacted renderer.
+func TestAddedAndRemovedProfilesAreReportedRowByRow(t *testing.T) {
+	newp := fixture.CopyOf(fixture.XL(), "new")
+	newp.Name = "schrodeck-m1-scratch"
+	newp.Pages[0].Buttons[0].Settings = `{"apiToken":"tok-NEW","label":"visible-label"}`
+	alias := "profile-2" // profile-N follows folder-name order
+	if newp.Folder() < fixture.XL().Folder() {
+		alias = "profile-1"
+	}
+	without := fixture.XL().FS()
+	with := fixture.Merge(fixture.XL().FS(), newp.FS())
+	for _, tc := range []struct {
+		name          string
+		before, after fstest.MapFS
+		kind          semdiff.Kind
+	}{
+		{"added", without, with, semdiff.Added},
+		{"removed", with, without, semdiff.Removed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rep, md := compare(t, tc.before, tc.after)
+			raw := rawDiff(t, tc.before, tc.after)
+			for _, leak := range []string{"tok-NEW", "schrodeck-m1-scratch"} {
+				if strings.Contains(md, leak) {
+					t.Errorf("report leaks %q:\n%s", leak, md)
+				}
+			}
+			if uuidPattern.MatchString(md) {
+				t.Errorf("report carries a raw UUID:\n%s", md)
+			}
+			var titled, secretRow, nameRow bool
+			for _, c := range rep.Changes {
+				if c.Profile != alias {
+					continue
+				}
+				if c.Kind != tc.kind {
+					t.Errorf("row of a wholly %s profile has kind %s: %+v", tc.kind, c.Kind, c)
+				}
+				v := c.After + c.Before
+				switch {
+				case c.Path == "States[0].Title" && v == `"Demo"`:
+					titled = true
+				case c.Path == "Settings.apiToken" && v == `"`+redact.Redacted+`"`:
+					secretRow = true
+				case c.Where == "profile" && c.Path == "Name" && v == alias:
+					nameRow = true
+				}
+			}
+			if !titled || !secretRow || !nameRow {
+				t.Errorf("missing leaf rows (title %v, redacted secret %v, aliased name %v):\n%s", titled, secretRow, nameRow, md)
+			}
+			if !strings.Contains(md, "visible-label") {
+				t.Errorf("a non-secret setting of the %s profile is missing:\n%s", tc.name, md)
+			}
+			// Known-bad control: the raw diff names the profile and nothing more.
+			if !strings.Contains(raw, "schrodeck-m1-scratch") || strings.Contains(raw, "tok-NEW") {
+				t.Fatalf("control: unexpected raw diff:\n%s", raw)
+			}
+		})
+	}
+}
+
+// I3: added subtrees are reported leaf by leaf, each leaf rendered by its own
+// path, so a new multi-action's child ActionIDs are visible as uuid-N rows.
+func TestAddedSubtreesAreReportedLeafByLeaf(t *testing.T) {
+	before, after := fixture.XL(), fixture.XL()
+	after.Pages[0].Buttons = append(after.Pages[0].Buttons, fixture.Button{Slot: "2,0", ActionID: "22222222-0000-4000-8000-000000000001", Plugin: "com.elgato.streamdeck.multiactions",
+		Settings: `{"Actions":[{"ActionID":"33333333-0000-4000-8000-000000000001","UUID":"com.elgato.streamdeck.system.hotkey"},{"ActionID":"33333333-0000-4000-8000-000000000002","UUID":"com.elgato.streamdeck.system.open","password":"pw-CHILD"}]}`, Title: "MA"})
+	rep, md := compare(t, before.FS(), after.FS())
+	if strings.Contains(md, "pw-CHILD") || uuidPattern.MatchString(md) {
+		t.Fatalf("report leaks a secret or raw UUID:\n%s", md)
+	}
+	children := map[string]string{}
+	for _, c := range rep.Changes {
+		if strings.HasSuffix(c.Where, "key 2,0") && strings.HasPrefix(c.Path, "Settings.Actions[") && strings.HasSuffix(c.Path, "].ActionID") {
+			children[c.Path] = c.After
+		}
+		if len([]rune(c.After)) > cellRunes {
+			t.Errorf("a leaf row carries a whole subtree (%d characters): %s", len([]rune(c.After)), c.After)
+		}
+	}
+	a0, a1 := children["Settings.Actions[0].ActionID"], children["Settings.Actions[1].ActionID"]
+	if !strings.HasPrefix(a0, `"uuid-`) || !strings.HasPrefix(a1, `"uuid-`) || a0 == a1 {
+		t.Fatalf("child ActionIDs are not their own distinct uuid-N rows (%q, %q):\n%s", a0, a1, md)
+	}
+	var childSecret bool
+	for _, c := range rep.Changes {
+		if c.Path == "Settings.Actions[1].password" && c.Kind == semdiff.Added && c.After == `"`+redact.Redacted+`"` {
+			childSecret = true
+		}
+	}
+	if !childSecret {
+		t.Errorf("the child's secret is not its own redacted row:\n%s", md)
+	}
+	// A new page's own leaves are rows too (the add-then-swap scenario).
+	b2, a2 := fixture.XL(), fixture.XL()
+	b2.Pages = b2.Pages[:1]
+	a2.Pages = []fixture.Page{a2.Pages[1], a2.Pages[0]}
+	rep2, md2 := compare(t, b2.FS(), a2.FS())
+	var newPageLeaf bool
+	for _, c := range rep2.Changes {
+		if strings.HasPrefix(c.Where, "profile-1/new-page-1 › key 7,3") && c.Path == "UUID" && c.After == `"com.elgato.streamdeck.page.next"` {
+			newPageLeaf = true
+		}
+	}
+	if !newPageLeaf {
+		t.Errorf("the new page's key 7,3 has no leaf rows:\n%s", md2)
+	}
+	// Known-bad control: the raw diff reports the button as one subtree that
+	// carries the secret.
+	if raw := rawDiff(t, before.FS(), after.FS()); !strings.Contains(raw, "pw-CHILD") {
+		t.Fatalf("control: the raw diff lacks the child secret:\n%s", raw)
+	}
+}
+
+// I3: the evidence row is bounded however large the change set is.
+func TestEvidenceRowIsBounded(t *testing.T) {
+	before, after := fixture.XL(), fixture.XL()
+	long := strings.Repeat("x", 5000)
+	after.Pages[0].Buttons[0].Title = long
+	after.Pages[0].Buttons[1].Title = long
+	for i := 0; i < 20; i++ {
+		after.Pages[1].Buttons = append(after.Pages[1].Buttons, fixture.Button{Slot: fmt.Sprintf("%d,1", i), ActionID: fmt.Sprintf("44444444-0000-4000-8000-%012d", i), Plugin: "com.elgato.streamdeck.system.open", Settings: `{"path":"` + long + `"}`})
+	}
+	rep, _ := compare(t, before.FS(), after.FS())
+	row := rep.EvidenceRow()
+	if n := utf8.RuneCountInString(row); n > evidenceRowRunes {
+		t.Errorf("evidence row is %d characters, want at most %d", n, evidenceRowRunes)
+	}
+	if !strings.Contains(row, "truncated") {
+		t.Errorf("a cut evidence row must say it is truncated: %s", row)
+	}
+	if !strings.HasSuffix(row, "(observations/t.md) |") {
+		t.Errorf("the cut must keep the row's link to the full report: %s", row)
+	}
+}
+
+// I4: a profile that exists but fails to load is reported as a load error,
+// never as removed.
+func TestLoadErrorsAreReportedNotRemovals(t *testing.T) {
+	before, after := fixture.XL(), fixture.XL()
+	after.Extra = map[string][]byte{"newthing.db": []byte("x")}
+	b := take(t, before, nil, t0)
+	a := take(t, after, nil, t0.Add(time.Minute))
+	if len(a.LoadErrors) != 1 {
+		t.Fatalf("control: the after snapshot must have one load error: %v", a.LoadErrors)
+	}
+	// A saved and reloaded snapshot keeps the error and its folder.
+	dir := filepath.Join(t.TempDir(), "after")
+	if err := a.Save(dir); err != nil {
+		t.Fatal(err)
+	}
+	for _, snap := range []struct {
+		name string
+		load func() *Snapshot
+	}{
+		{"in memory", func() *Snapshot { return a }},
+		{"saved and loaded", func() *Snapshot {
+			s, err := Load(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return s
+		}},
+	} {
+		t.Run(snap.name, func(t *testing.T) {
+			rep, err := Compare("t", b, snap.load(), redactor(t))
+			if err != nil {
+				t.Fatal(err)
+			}
+			md := rep.Markdown()
+			if !strings.Contains(md, "| profile-1 | load error |") || !strings.Contains(md, "newthing.db") {
+				t.Errorf("no load error row for profile-1:\n%s", md)
+			}
+			for _, c := range rep.Changes {
+				if c.Kind == semdiff.Removed {
+					t.Errorf("a present but unloadable profile is reported as removed: %+v", c)
+				}
+			}
+			if uuidPattern.MatchString(md) {
+				t.Errorf("load error row carries a raw UUID:\n%s", md)
+			}
+		})
+	}
+	// Known-bad control: the error message itself names the raw folder id.
+	if !uuidPattern.MatchString(a.LoadErrors[0].Message) {
+		t.Fatalf("control: the load error has no UUID to pseudonymize: %q", a.LoadErrors[0].Message)
+	}
+}
+
+// M8: the header warns that profile-N numbers are per report.
+func TestHeaderSaysProfileNumbersArePerReport(t *testing.T) {
+	_, md := compare(t, fixture.XL().FS(), fixture.XL().FS())
+	if !strings.Contains(md, "profile-N numbers are assigned per report and can differ between reports.") {
+		t.Fatalf("header lacks the profile-N note:\n%s", md)
 	}
 }

@@ -333,3 +333,56 @@ func TestPageChangesNameTheirPageAndSlot(t *testing.T) {
 		}
 	}
 }
+
+func TestLeavesExpandAddedAndRemovedSubtrees(t *testing.T) {
+	a := mustParse(t, `{"keep":1}`)
+	b := mustParse(t, `{"keep":1,"new":{"x":[1,{"y":true}],"empty":{},"none":[]}}`)
+	got := render(ValueLeaves("p", "w", a, b))
+	want := strings.Join([]string{
+		"p: w › new.x[0] added: 1",
+		"p: w › new.x[1].y added: true",
+		"p: w › new.empty added: {}",
+		"p: w › new.none added: []",
+	}, "\n")
+	if got != want {
+		t.Fatalf("ValueLeaves added:\n%s\nwant:\n%s", got, want)
+	}
+	if got := render(ValueLeaves("p", "w", b, a)); got != strings.ReplaceAll(strings.ReplaceAll(want, " added: ", " removed (was "), "\n", ")\n")+")" {
+		t.Fatalf("ValueLeaves removed:\n%s", got)
+	}
+	// Known-bad control: Values keeps the subtree in one change.
+	if got := render(Values("p", "w", a, b)); strings.Count(got, "\n") != 0 || !strings.Contains(got, `"x":[1,{"y":true}]`) {
+		t.Fatalf("Values no longer reports the subtree whole:\n%s", got)
+	}
+}
+
+func TestProfileLeavesKeepPagesAndSlots(t *testing.T) {
+	before, after := fixture.XL(), fixture.XL()
+	after.Pages[0].Buttons = append(after.Pages[0].Buttons, fixture.Button{Slot: "2,0", ActionID: "22222222-0000-4000-8000-000000000001", Plugin: "com.elgato.streamdeck.multiactions",
+		Settings: `{"Actions":[{"ActionID":"33333333-0000-4000-8000-000000000001"}]}`})
+	cs, err := ProfileLeaves(loadP(t, before), loadP(t, after), Raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, c := range cs {
+		if c.Kind != Added || !strings.HasSuffix(c.Where, "key 2,0") || c.SlotPath != "Controllers[0].Actions.2,0" || c.Page == "" {
+			t.Errorf("leaf of the new key is not placed in its slot: %+v", c)
+		}
+		if c.Path == "Settings.Actions[0].ActionID" && c.After == `"33333333-0000-4000-8000-000000000001"` {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("the child ActionID is not its own leaf:\n%s", render(cs))
+	}
+}
+
+func mustParse(t *testing.T, s string) *jsondoc.Value {
+	t.Helper()
+	v, err := jsondoc.Parse([]byte(s))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return v
+}

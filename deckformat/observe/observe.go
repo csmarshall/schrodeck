@@ -21,8 +21,10 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/csmarshall/schrodeck/deckformat/jsondoc"
 	"github.com/csmarshall/schrodeck/deckformat/normhash"
@@ -36,15 +38,23 @@ type Snapshot struct {
 	TakenAt    time.Time
 	AppVersion string
 	Profiles   map[string]*profile.Profile // by folder name
-	LoadErrors []string
+	LoadErrors []LoadError
 	Prefs      *jsondoc.Value // may be nil
 }
 
+// LoadError is a profile folder that exists but failed to load (for example
+// a file outside contract C's allow-list, P7). It is kept with its folder so a
+// report can say which profile it is instead of calling it removed.
+type LoadError struct {
+	Folder  string `json:"folder"`
+	Message string `json:"message"`
+}
+
 type meta struct {
-	TakenAt     time.Time `json:"taken_at"`
-	AppVersion  string    `json:"app_version"`
-	NormVersion int       `json:"norm_version"`
-	LoadErrors  []string  `json:"load_errors,omitempty"`
+	TakenAt     time.Time   `json:"taken_at"`
+	AppVersion  string      `json:"app_version"`
+	NormVersion int         `json:"norm_version"`
+	LoadErrors  []LoadError `json:"load_errors,omitempty"`
 }
 
 // Take reads every profile in profiles (a ProfilesV3-shaped fs.FS).
@@ -58,7 +68,12 @@ func Take(profiles fs.FS, prefs *jsondoc.Value, appVersion string, now time.Time
 		s.Profiles[p.Folder] = p
 	}
 	for _, e := range res.Errors {
-		s.LoadErrors = append(s.LoadErrors, e.Error())
+		le := LoadError{Message: e.Error()}
+		var fe *profile.FolderError
+		if errors.As(e, &fe) {
+			le.Folder = fe.Folder
+		}
+		s.LoadErrors = append(s.LoadErrors, le)
 	}
 	return s, nil
 }
@@ -76,7 +91,9 @@ func (s *Snapshot) Digest() string {
 		sum := sha256.Sum256(s.Prefs.Encode())
 		lines = append(lines, "prefs\x00"+hex.EncodeToString(sum[:]))
 	}
-	lines = append(lines, s.LoadErrors...)
+	for _, le := range s.LoadErrors {
+		lines = append(lines, "load error\x00"+le.Folder+"\x00"+le.Message)
+	}
 	sort.Strings(lines)
 	h := sha256.Sum256([]byte(strings.Join(lines, "\n")))
 	return hex.EncodeToString(h[:])
@@ -84,8 +101,12 @@ func (s *Snapshot) Digest() string {
 
 // Settle takes snapshots until two consecutive ones are identical, waiting
 // between them, so a snapshot is not taken while the app is mid-write. It
-// gives up after maxTries snapshots.
+// gives up after maxTries snapshots; maxTries must be at least 2, since one
+// snapshot cannot show that anything settled.
 func Settle(take func() (*Snapshot, error), wait func(), maxTries int) (*Snapshot, error) {
+	if maxTries < 2 {
+		return nil, fmt.Errorf("observe: Settle needs at least 2 snapshots to compare, got maxTries %d", maxTries)
+	}
 	prev, err := take()
 	if err != nil {
 		return nil, err
@@ -217,39 +238,84 @@ type Report struct {
 	Changes    []semdiff.Change `json:"changes"`
 }
 
+// LoadFailed is the Kind of a report row for a profile folder that exists but
+// failed to load; Before and After carry the (redacted) error on each side.
+const LoadFailed semdiff.Kind = "load error"
+
+// emptyManifest is the manifest of the empty profile an added or removed
+// profile is diffed against: just enough structure (Pages.Pages) for the page
+// labels to resolve, so every real member shows up as its own leaf.
+const emptyManifest = `{"Pages":{"Pages":[]}}`
+
+// emptyProfile stands for a profile that is absent on one side.
+func emptyProfile(folder string) (*profile.Profile, error) {
+	m, err := jsondoc.Parse([]byte(emptyManifest))
+	if err != nil {
+		return nil, err
+	}
+	return &profile.Profile{Folder: folder, Manifest: m, Images: map[string][]byte{}, Pages: map[string]*profile.Page{}}, nil
+}
+
+// loadErrorsByFolder groups a snapshot's load errors by folder ("" for an
+// error that names none).
+func loadErrorsByFolder(s *Snapshot) map[string]string {
+	out := map[string]string{}
+	for _, le := range s.LoadErrors {
+		if prev, ok := out[le.Folder]; ok {
+			out[le.Folder] = prev + "; " + le.Message
+			continue
+		}
+		out[le.Folder] = le.Message
+	}
+	return out
+}
+
 // Compare diffs two snapshots (raw mode: runtime fields and ids included,
 // since that is what an observation is for) and redacts the result. Profile
-// names are user content, so the Profile column and added/removed profile
-// values carry the profile-N alias instead. Changes are detected on the raw
-// snapshots but rendered out of redacted copies of the whole documents (see
-// renderer), so a changed secret shows as <redacted> on both sides and the row
-// stays.
+// names are user content, so the Profile column and profile Name values carry
+// the profile-N alias instead. A profile present on one side only is diffed
+// against an empty profile, and an added or removed subtree is reported leaf
+// by leaf (semdiff.ProfileLeaves), so every row carries one value. A profile
+// folder that exists but failed to load is one "load error" row, never an
+// added or removed profile. Changes are detected on the raw snapshots but
+// rendered out of redacted copies of the whole documents (see renderer), so a
+// changed secret shows as <redacted> on both sides and the row stays.
 func Compare(name string, before, after *Snapshot, r *redact.Redactor) (Report, error) {
 	ps := newPseudonyms(before, after)
+	errBefore, errAfter := loadErrorsByFolder(before), loadErrorsByFolder(after)
 	folders := map[string]bool{}
-	for f := range before.Profiles {
-		folders[f] = true
+	for _, m := range []map[string]*profile.Profile{before.Profiles, after.Profiles} {
+		for f := range m {
+			folders[f] = true
+		}
 	}
-	for f := range after.Profiles {
-		folders[f] = true
+	for _, m := range []map[string]string{errBefore, errAfter} {
+		for f := range m {
+			folders[f] = true
+		}
 	}
-	var sorted []string
-	for f := range folders {
-		sorted = append(sorted, f)
-	}
-	sort.Strings(sorted)
 	var changes []semdiff.Change
 	var changeFolder []string // the profile folder behind each change
-	for _, folder := range sorted {
+	for _, folder := range sortedKeys(folders) {
 		alias := ps.profileAlias(folder)
-		a, b := before.Profiles[folder], after.Profiles[folder]
-		switch {
-		case a == nil:
-			changes = append(changes, semdiff.Change{Profile: alias, Where: "profiles", Path: folder, Kind: semdiff.Added, After: alias})
-		case b == nil:
-			changes = append(changes, semdiff.Change{Profile: alias, Where: "profiles", Path: folder, Kind: semdiff.Removed, Before: alias})
-		default:
-			cs, err := semdiff.Profiles(a, b, semdiff.Raw)
+		eb, failedBefore := errBefore[folder]
+		ea, failedAfter := errAfter[folder]
+		if failedBefore || failedAfter {
+			// One side cannot be read, so nothing about its content is known:
+			// report the failure, not a removal, addition or diff.
+			changes = append(changes, semdiff.Change{Profile: alias, Where: string(LoadFailed), Kind: LoadFailed, Before: eb, After: ea})
+		} else {
+			a, b := before.Profiles[folder], after.Profiles[folder]
+			var err error
+			if a == nil {
+				a, err = emptyProfile(folder)
+			} else if b == nil {
+				b, err = emptyProfile(folder)
+			}
+			if err != nil {
+				return Report{}, err
+			}
+			cs, err := semdiff.ProfileLeaves(a, b, semdiff.Raw)
 			if err != nil {
 				return Report{}, fmt.Errorf("%s: %w", folder, err)
 			}
@@ -263,7 +329,7 @@ func Compare(name string, before, after *Snapshot, r *redact.Redactor) (Report, 
 		}
 	}
 	if before.Prefs != nil || after.Prefs != nil {
-		changes = append(changes, semdiff.Values("app preferences", "prefs", before.Prefs, after.Prefs)...)
+		changes = append(changes, semdiff.ValueLeaves("app preferences", "prefs", before.Prefs, after.Prefs)...)
 		for len(changeFolder) < len(changes) {
 			changeFolder = append(changeFolder, "")
 		}
@@ -271,11 +337,18 @@ func Compare(name string, before, after *Snapshot, r *redact.Redactor) (Report, 
 	rd := newRenderer(before, after, r)
 	for i := range changes {
 		c := &changes[i]
-		if c.Where == "profile" && c.Path == "Name" {
+		switch {
+		case c.Kind == LoadFailed:
+			// Error text is not a document value: redact it as plain text.
+			c.Before, c.After = r.String(c.Before), r.String(c.After)
+		case c.Where == "profile" && c.Path == "Name":
 			// The profile's own name is user content: both sides become its alias.
-			c.Before, c.After = renamed(c.Before, c.Profile), renamed(c.After, c.Profile)
-		} else {
+			c.Before, c.After = profileName(c.Before, c.Profile, c.Kind), profileName(c.After, c.Profile, c.Kind)
+		default:
 			rd.render(changeFolder[i], c)
+		}
+		if c.Page != "" {
+			c.Where = ps.pageWhere(c.Where, c.Page)
 		}
 		c.Profile, c.Where, c.Path = r.String(c.Profile), r.String(c.Where), r.String(c.Path)
 		c.Profile, c.Where, c.Path = ps.String(c.Profile), ps.String(c.Where), ps.String(c.Path)
@@ -286,10 +359,14 @@ func Compare(name string, before, after *Snapshot, r *redact.Redactor) (Report, 
 	return Report{Name: name, Before: before.TakenAt, After: after.TakenAt, AppVersion: after.AppVersion, Changes: changes}, nil
 }
 
-// renamed stands for a present profile name without showing it.
-func renamed(value, alias string) string {
+// profileName stands for a present profile name without showing it: the alias
+// for a profile that is added or removed, "<alias> (renamed)" for a rename.
+func profileName(value, alias string, kind semdiff.Kind) string {
 	if value == "" {
 		return value
+	}
+	if kind != semdiff.Modified {
+		return alias
 	}
 	return alias + " (renamed)"
 }
@@ -300,36 +377,50 @@ var uuidPattern = regexp.MustCompile(`[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{
 // pseudonyms replaces every UUID in a report with a stable, readable name, so
 // a committed report carries no real profile, page or action ids while every
 // equality between ids stays visible (the same id always gets the same name).
-// Profile folders become "profile-1", "profile-2", … in folder-name order;
-// pages become "profile-1/page/0", "profile-1/default" or
-// "profile-1/sub-page-1" by their position before the change (after it, for a
-// page that is new); any other UUID (an ActionID, an unknown reference)
-// becomes "uuid-1", "uuid-2", … in order of first appearance.
+// Profile folders, loaded or not, become "profile-1", "profile-2", … in
+// folder-name order, so the numbers are per report. A page present in the
+// first snapshot is named by its position there ("profile-1/page/0",
+// "profile-1/default", "profile-1/sub-page-1"); a page that appears only in a
+// later snapshot is "profile-1/new-page-1", "profile-1/new-page-2", …, never a
+// position name, which an existing page may already hold. Any other UUID (an
+// ActionID, an unknown reference) becomes "uuid-1", "uuid-2", … in order of
+// first appearance. The naming is injective: no two ids share a name.
 type pseudonyms struct {
 	names map[string]string // lower-case UUID → pseudonym
 	next  int
 }
 
+// labelOrder sorts page labels by position: Pages.Pages in list order, then
+// the default page, then pages listed nowhere (by id).
+func labelOrder(label string) (int, int, string) {
+	if n, err := strconv.Atoi(strings.TrimPrefix(label, "page/")); err == nil && strings.HasPrefix(label, "page/") {
+		return 0, n, ""
+	}
+	if label == "default" {
+		return 1, 0, ""
+	}
+	return 2, 0, label
+}
+
+// newPseudonyms names the ids of snaps; the first snapshot is the "before" one.
 func newPseudonyms(snaps ...*Snapshot) *pseudonyms {
 	ps := &pseudonyms{names: map[string]string{}}
-	folders := map[string]*profile.Profile{}
+	folders := map[string]bool{}
 	for _, s := range snaps {
-		for folder, p := range s.Profiles {
-			if _, seen := folders[folder]; !seen {
-				folders[folder] = p
+		for folder := range s.Profiles {
+			folders[folder] = true
+		}
+		for _, le := range s.LoadErrors {
+			if le.Folder != "" {
+				folders[le.Folder] = true
 			}
 		}
 	}
-	var sorted []string
-	for f := range folders {
-		sorted = append(sorted, f)
-	}
-	sort.Strings(sorted)
-	for i, folder := range sorted {
+	for i, folder := range sortedKeys(folders) {
 		prof := fmt.Sprintf("profile-%d", i+1)
 		ps.names[strings.ToLower(strings.TrimSuffix(folder, profile.Suffix))] = prof
-		subPages := 0
-		for _, s := range snaps {
+		subPages, newPages := 0, 0
+		for si, s := range snaps {
 			p := s.Profiles[folder]
 			if p == nil {
 				continue
@@ -338,17 +429,28 @@ func newPseudonyms(snaps ...*Snapshot) *pseudonyms {
 			if err != nil {
 				continue // a malformed profile: its page ids fall back to uuid-N
 			}
-			var ids []string
-			for id := range labels {
-				ids = append(ids, id)
-			}
-			sort.Strings(ids)
+			ids := sortedKeys(labels)
+			sort.SliceStable(ids, func(x, y int) bool {
+				xa, xb, xc := labelOrder(labels[ids[x]])
+				ya, yb, yc := labelOrder(labels[ids[y]])
+				if xa != ya {
+					return xa < ya
+				}
+				if xb != yb {
+					return xb < yb
+				}
+				return xc < yc
+			})
 			for _, id := range ids {
 				if _, named := ps.names[id]; named {
 					continue
 				}
 				label := labels[id]
-				if strings.HasPrefix(label, "other/") {
+				switch {
+				case si > 0:
+					newPages++
+					label = fmt.Sprintf("new-page-%d", newPages)
+				case strings.HasPrefix(label, "other/"):
 					subPages++
 					label = fmt.Sprintf("sub-page-%d", subPages)
 				}
@@ -362,6 +464,23 @@ func newPseudonyms(snaps ...*Snapshot) *pseudonyms {
 // profileAlias is the profile-N name of a profile folder.
 func (ps *pseudonyms) profileAlias(folder string) string {
 	return ps.names[strings.ToLower(strings.TrimSuffix(folder, profile.Suffix))]
+}
+
+// pageWhere rewrites a raw-mode page location, "page 2 (<page id>) › key 0,0",
+// to name the page by its pseudonym alone: "profile-1/page/1 › key 0,0". The
+// position number in front comes from the after snapshot while the pseudonym
+// comes from the before one, so showing both would mislead.
+func (ps *pseudonyms) pageWhere(where, page string) string {
+	marker := " (" + page + ")"
+	i := strings.Index(where, marker)
+	if i < 0 {
+		return where
+	}
+	name, ok := ps.names[strings.ToLower(page)]
+	if !ok {
+		name = page
+	}
+	return name + where[i+len(marker):]
 }
 
 // String replaces every UUID in s.
@@ -387,6 +506,9 @@ func escape(s string) string {
 // never splits a multi-byte character).
 const cellRunes = 120
 
+// evidenceRowRunes bounds the draft evidence row, in characters.
+const evidenceRowRunes = 600
+
 // cell escapes and shortens long JSON fragments for the change table.
 func cell(s string) string {
 	s = escape(s)
@@ -402,7 +524,8 @@ func (rep Report) Markdown() string {
 	fmt.Fprintf(&b, "# Observation: %s\n\n", rep.Name)
 	fmt.Fprintf(&b, "- Before: %s · After: %s · App: %s · norm_version: %d\n", rep.Before.Format(time.RFC3339), rep.After.Format(time.RFC3339), rep.AppVersion, normhash.NormVersion)
 	fmt.Fprintf(&b, "- Changes (raw, redacted): %d\n", len(rep.Changes))
-	b.WriteString("- Titles, page names and setting values are shown as-is; review before committing.\n\n")
+	b.WriteString("- Titles, page names and setting values are shown as-is; review before committing.\n")
+	b.WriteString("- profile-N numbers are assigned per report and can differ between reports.\n\n")
 	if len(rep.Changes) > 0 {
 		b.WriteString("| Profile | Where | Path | Change | Before | After |\n|---|---|---|---|---|---|\n")
 		for _, c := range rep.Changes {
@@ -415,22 +538,38 @@ func (rep Report) Markdown() string {
 	return b.String()
 }
 
+// evidenceChanges is how many changes the evidence row summarizes.
+const evidenceChanges = 3
+
 // EvidenceRow is a draft row for docs/references.md. A person fills in the id
-// and topic and rewrites the summary as a claim.
+// and topic and rewrites the summary as a claim. The summary names at most
+// evidenceChanges changes and the row is at most evidenceRowRunes characters
+// (for a report name of ordinary length); a cut summary says so and points to
+// the full report.
 func (rep Report) EvidenceRow() string {
-	var summary []string
+	var parts []string
 	for i, c := range rep.Changes {
-		if i == 3 {
-			summary = append(summary, fmt.Sprintf("and %d more", len(rep.Changes)-3))
+		if i == evidenceChanges {
 			break
 		}
-		summary = append(summary, c.String())
+		parts = append(parts, c.String())
 	}
-	if len(summary) == 0 {
-		summary = []string{"no change on disk"}
+	summary := escape(strings.Join(parts, "; "))
+	if len(parts) == 0 {
+		summary = "no change on disk"
 	}
-	return fmt.Sprintf("| R?? | <topic> | **Observed** | `schrodeck observe %s`, app %s, %s | %s. Full report: [observations/%s.md](observations/%s.md) |",
-		rep.Name, rep.AppVersion, rep.After.Format("2006-01-02"), escape(strings.Join(summary, "; ")), rep.Name, rep.Name)
+	head := fmt.Sprintf("| R?? | <topic> | **Observed** | `schrodeck observe %s`, app %s, %s | ", rep.Name, rep.AppVersion, rep.After.Format("2006-01-02"))
+	tail := fmt.Sprintf(". Full report: [observations/%s.md](observations/%s.md) |", rep.Name, rep.Name)
+	note := fmt.Sprintf(" … (truncated; %d change(s) in the full report)", len(rep.Changes))
+	budget := evidenceRowRunes - utf8.RuneCountInString(head) - utf8.RuneCountInString(tail)
+	if len(rep.Changes) > evidenceChanges || utf8.RuneCountInString(summary) > budget {
+		keep := max(budget-utf8.RuneCountInString(note), 0)
+		if r := []rune(summary); len(r) > keep {
+			summary = string(r[:keep])
+		}
+		summary += note
+	}
+	return head + summary + tail
 }
 
 // renderer renders a change's Before/After out of REDACTED copies of the whole
@@ -438,6 +577,9 @@ func (rep Report) EvidenceRow() string {
 // (member names, name/value pairs, embedded JSON, URLs, bearer values) applies
 // in context instead of to a bare scalar that has lost its surroundings. The
 // change is detected on the raw snapshots; only its rendering is redacted.
+// Only raw-mode changes resolve: a semantic-mode change names its page by a
+// canonical label, not a Profile.Pages key, so it finds no page and is
+// blanked (fail closed).
 type renderer struct {
 	before, after *Snapshot
 	r             *redact.Redactor
