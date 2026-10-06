@@ -78,7 +78,7 @@ type Deck struct {
     Geometry         Geometry // columns, rows, dials: the DeviceType's documented key and dial counts (R8) with an observed grid split; see ADR 0003
     Model      string
     Virtual    bool
-    SerialHash string // optional, informational (ADR 0003); "" if unknown
+    SerialHash string // optional (ADR 0003); "" if unknown. Derived from the deck serial: treat it as an identifier, never log or print it
 }
 type DeviceEnumerator interface { Decks() ([]Deck, error) }
 ```

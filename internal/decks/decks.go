@@ -115,23 +115,37 @@ func Validate(types map[int]TypeInfo, products map[[2]int]int) error {
 	return nil
 }
 
-var physicalKey = regexp.MustCompile(`^@\((\d+)\)\[(\d+)/(\d+)/([^\]]*)\]$`)
+var (
+	deviceKey    = regexp.MustCompile(`^@\(([0-9]+)\)\[([^\]]*)\]$`)
+	physicalBody = regexp.MustCompile(`^([0-9]+)/([0-9]+)/(.+)$`)
+)
 
-// ParseKey splits a device key. Virtual decks are "@(0)[]" (R12). A physical key needs numeric vendor and product and a non-empty serial.
+// ParseKey splits a device key "@(<type>)[<body>]". Type 0 is a virtual deck
+// in ANY form (R12 shows "@(0)[]"; a body after type 0 is not trusted to make
+// it physical). Only type 1 is a physical deck, and it needs numeric vendor
+// and product and a non-empty serial. Any other type is rejected, so the
+// record is dropped from the deck list and shows up in Unmatched.
 func ParseKey(key string) (virtual bool, vendor, product int, serial string, ok bool) {
-	if key == VirtualKey {
-		return true, 0, 0, "", true
-	}
-	m := physicalKey.FindStringSubmatch(key)
+	m := deviceKey.FindStringSubmatch(key)
 	if m == nil {
 		return false, 0, 0, "", false
 	}
-	vendor, errV := strconv.Atoi(m[2])
-	product, errP := strconv.Atoi(m[3])
-	if errV != nil || errP != nil || m[4] == "" {
-		return false, 0, 0, "", false
+	switch m[1] {
+	case "0":
+		return true, 0, 0, "", true
+	case "1":
+		pm := physicalBody.FindStringSubmatch(m[2])
+		if pm == nil {
+			return false, 0, 0, "", false
+		}
+		vendor, errV := strconv.Atoi(pm[1])
+		product, errP := strconv.Atoi(pm[2])
+		if errV != nil || errP != nil {
+			return false, 0, 0, "", false
+		}
+		return false, vendor, product, pm[3], true
 	}
-	return false, vendor, product, m[4], true
+	return false, 0, 0, "", false
 }
 
 // Enumerate builds the deck list from device records and loaded profiles.
@@ -192,7 +206,7 @@ func Annotate(ds []ports.Deck) []Status {
 	// never unique, so such a deck is never a destination.
 	out := make([]Status, 0, len(ds))
 	for _, d := range ds {
-		out = append(out, Status{Deck: d, GeometryKnown: d.Geometry.Columns > 0 && d.Geometry.Rows > 0, KeyUnique: d.AppDeviceID != VirtualKey && count[d.AppDeviceID] == 1})
+		out = append(out, Status{Deck: d, GeometryKnown: d.Geometry.Columns > 0 && d.Geometry.Rows > 0, KeyUnique: !d.Virtual && count[d.AppDeviceID] == 1})
 	}
 	return out
 }

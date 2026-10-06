@@ -20,7 +20,7 @@ func TestParseKey(t *testing.T) {
 	if v, _, _, _, ok := ParseKey("@(0)[]"); !ok || !v {
 		t.Fatal("virtual deck not recognized")
 	}
-	for _, bad := range []string{"", "Devices", "@(1)[4057/143]", "x@(1)[1/2/3]", "@(1)[4057/143/]", "@(1)[99999999999999999999/1/<deck>]", "@(1)[1/99999999999999999999/<deck>]"} {
+	for _, bad := range []string{"", "Devices", "@(1)[4057/143]", "x@(1)[1/2/3]", "@(1)[4057/143/]", "@(2)[4057/143/<deck>]", "@(9)[]", "@(1)[]", "@(1)[99999999999999999999/1/<deck>]", "@(1)[1/99999999999999999999/<deck>]"} {
 		if _, _, _, _, ok := ParseKey(bad); ok {
 			t.Errorf("ParseKey(%q) accepted", bad)
 		}
@@ -156,5 +156,32 @@ func TestVirtualKeyIsNeverUnique(t *testing.T) {
 	d := ports.Deck{AppDeviceID: VirtualKey, Virtual: true, Geometry: ports.Geometry{Columns: 8, Rows: 4}}
 	if st := Annotate([]ports.Deck{d}); st[0].KeyUnique || st[0].Destination() {
 		t.Fatalf("a lone virtual deck must not be a destination: %+v", st[0])
+	}
+}
+
+// Known-bad: type 0 with a physical-looking body must stay virtual (never
+// unique, never a destination), and an unknown type must be rejected.
+func TestOnlyTypeOneIsPhysical(t *testing.T) {
+	if v, _, _, _, ok := ParseKey("@(0)[4057/143/<deck>]"); !ok || !v {
+		t.Fatalf("type 0 with a body must parse as virtual, got virtual=%v ok=%v", v, ok)
+	}
+	if _, _, _, _, ok := ParseKey("@(2)[4057/143/<deck>]"); ok {
+		t.Fatal("type 2 accepted")
+	}
+	known := map[[2]int]ports.Geometry{{4057, 143}: {Columns: 8, Rows: 4}}
+	records := []map[string]any{{RecordKey: "@(0)[4057/143/<deck>]"}, {RecordKey: "@(2)[4057/143/<deck>]"}}
+	ds := Enumerate(records, nil, known)
+	if len(ds) != 1 || !ds[0].Virtual {
+		t.Fatalf("decks = %+v", ds)
+	}
+	ds[0].Geometry = ports.Geometry{Columns: 8, Rows: 4}
+	for _, st := range Annotate(ds) {
+		if st.Destination() {
+			t.Fatalf("a type-0 key became a destination: %+v", st)
+		}
+	}
+	_, unbound := Unmatched(records, nil)
+	if len(unbound) != 2 {
+		t.Errorf("Unmatched must list both keys, got %v", unbound)
 	}
 }
