@@ -7,6 +7,7 @@ package jsondoc
 import (
 	"encoding/json"
 	"errors"
+	"math"
 	"strings"
 	"testing"
 )
@@ -98,7 +99,10 @@ func TestAccessorsAndMutation(t *testing.T) {
 }
 
 func TestWalkPaths(t *testing.T) {
-	v, _ := Parse([]byte(`{"a":[{"b":1}],"c":2}`))
+	v, err := Parse([]byte(`{"a":[{"b":1}],"c":2}`))
+	if err != nil {
+		t.Fatal(err)
+	}
 	var paths []string
 	v.Walk(func(p []string, _ *Value) { paths = append(paths, strings.Join(p, ".")) })
 	if got := strings.Join(paths, " | "); got != " | a | a.[0] | a.[0].b | c" {
@@ -107,7 +111,10 @@ func TestWalkPaths(t *testing.T) {
 }
 
 func TestCanonicalIsJCS(t *testing.T) {
-	v, _ := Parse([]byte(`{"b":1.50,"a":"x` + bs + `/y"}`))
+	v, err := Parse([]byte(`{"b":1.50,"a":"x` + bs + `/y"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
 	c, err := v.Canonical()
 	if err != nil {
 		t.Fatal(err)
@@ -130,5 +137,31 @@ func TestFromAny(t *testing.T) {
 	}
 	if _, err := FromAny(struct{}{}); err == nil {
 		t.Fatal("unsupported type accepted")
+	}
+	// Non-finite floats must be rejected
+	if _, err := FromAny(math.NaN()); err == nil {
+		t.Fatal("NaN accepted")
+	}
+	if _, err := FromAny(math.Inf(1)); err == nil {
+		t.Fatal("+Inf accepted")
+	}
+	if _, err := FromAny(math.Inf(-1)); err == nil {
+		t.Fatal("-Inf accepted")
+	}
+}
+
+func TestInvalidUTF8Sanitization(t *testing.T) {
+	// NewString with invalid UTF-8 sanitizes and encodes to valid JSON
+	v := NewString("a\xffb")
+	encoded := v.Encode()
+	if _, err := Parse(encoded); err != nil {
+		t.Fatalf("NewString with invalid UTF-8 produced non-round-trippable output: %v", err)
+	}
+	// RenameMember with invalid UTF-8 sanitizes
+	obj, _ := Parse([]byte(`{"x":1}`))
+	obj.RenameMember(0, "a\xffb")
+	encoded = obj.Encode()
+	if _, err := Parse(encoded); err != nil {
+		t.Fatalf("RenameMember with invalid UTF-8 produced non-round-trippable output: %v", err)
 	}
 }

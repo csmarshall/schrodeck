@@ -15,8 +15,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"sort"
 	"strconv"
+	"strings"
 )
 
 // Kind is a JSON value's type.
@@ -157,12 +159,14 @@ func (v *Value) appendTo(b []byte) []byte {
 	}
 }
 
-// appendQuoted quotes s. Names and strings in a tree come from Parse (valid
-// UTF-8) or NewString, so AppendQuote cannot fail here.
+// appendQuoted quotes s. Parsed values keep their raw bytes and never go
+// through this path; only strings built by callers (NewString, SetString, Set,
+// RenameMember) are sanitized here using ToValidUTF8.
 func appendQuoted(b []byte, s string) []byte {
+	s = strings.ToValidUTF8(s, "\xef\xbf\xbd")
 	out, err := jsontext.AppendQuote(b, s)
 	if err != nil {
-		panic(fmt.Sprintf("jsondoc: invalid UTF-8 in %q", s))
+		panic(fmt.Sprintf("jsondoc: internal error quoting %q: %v", s, err))
 	}
 	return out
 }
@@ -316,6 +320,9 @@ func FromAny(x any) (*Value, error) {
 	case uint64:
 		return &Value{kind: Number, raw: []byte(strconv.FormatUint(t, 10))}, nil
 	case float64:
+		if math.IsNaN(t) || math.IsInf(t, 0) {
+			return nil, fmt.Errorf("jsondoc: non-finite float %v", t)
+		}
 		return &Value{kind: Number, raw: jsontext.AppendFloat(nil, t, 64)}, nil
 	case []any:
 		v := &Value{kind: Array}
