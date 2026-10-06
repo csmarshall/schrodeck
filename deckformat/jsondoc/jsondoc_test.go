@@ -165,3 +165,74 @@ func TestInvalidUTF8Sanitization(t *testing.T) {
 		t.Fatalf("RenameMember with invalid UTF-8 produced non-round-trippable output: %v", err)
 	}
 }
+
+func TestDeleteWhileRangingOverEarlierMembers(t *testing.T) {
+	v, err := Parse([]byte(`{"a":1,"b":2,"c":3,"d":4}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var seen []string
+	for _, m := range v.Members() { // the slice is taken before any Delete
+		seen = append(seen, m.Name)
+		if m.Name == "b" || m.Name == "c" {
+			v.Delete(m.Name)
+		}
+	}
+	if got := strings.Join(seen, ","); got != "a,b,c,d" {
+		t.Errorf("range over earlier Members() saw %s, want a,b,c,d", got)
+	}
+	if got := string(v.Encode()); got != `{"a":1,"d":4}` {
+		t.Errorf("after deleting two adjacent members = %s", got)
+	}
+}
+
+func mustPanic(t *testing.T, what string, fn func()) {
+	t.Helper()
+	defer func() {
+		if recover() == nil {
+			t.Errorf("%s did not panic", what)
+		}
+	}()
+	fn()
+}
+
+func TestSetPanicsOnProgrammerError(t *testing.T) {
+	obj, err := Parse([]byte(`{"a":1}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustPanic(t, "Set on an array", func() {
+		arr, _ := Parse([]byte(`[1]`))
+		arr.Set("x", NewString("y"))
+	})
+	mustPanic(t, "Set on a string", func() { NewString("s").Set("x", NewString("y")) })
+	mustPanic(t, "Set with a nil value", func() { obj.Set("x", nil) })
+	if got := string(obj.Encode()); got != `{"a":1}` {
+		t.Errorf("a panicking Set changed the object: %s", got)
+	}
+}
+
+func TestCanonicalRefusesLossyNumbers(t *testing.T) {
+	for _, bad := range []string{`1e400`, `-1e400`, `9007199254740993`, `-9007199254740993`, `[{"n":1e999}]`} {
+		v, err := Parse([]byte(bad))
+		if err != nil {
+			t.Fatalf("%s: Parse: %v", bad, err)
+		}
+		if c, err := v.Canonical(); err == nil {
+			t.Errorf("Canonical(%s) = %s, want an error", bad, c)
+		}
+	}
+	for in, want := range map[string]string{
+		`1.50`: `1.5`, `0.1`: `0.1`, `9007199254740992`: `9007199254740992`,
+		`9007199254740994`: `9007199254740994`, `1e300`: `1e+300`, `1E2`: `100`,
+	} {
+		v, err := Parse([]byte(in))
+		if err != nil {
+			t.Fatalf("%s: Parse: %v", in, err)
+		}
+		c, err := v.Canonical()
+		if err != nil || string(c) != want {
+			t.Errorf("Canonical(%s) = %s, %v; want %s", in, c, err, want)
+		}
+	}
+}

@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/big"
 	"sort"
 	"strconv"
 	"strings"
@@ -171,13 +172,55 @@ func appendQuoted(b []byte, s string) []byte {
 	return out
 }
 
-// Canonical returns the RFC 8785 (JCS) form of the value.
+// maxExactInt is 2^53, the largest magnitude below which every integer is
+// exactly representable as a float64.
+const maxExactInt = 1 << 53
+
+// Canonical returns the RFC 8785 (JCS) form of the value. JCS is defined over
+// float64, so a number literal that float64 cannot hold (it overflows to
+// infinity, or is an integer beyond 2^53 that changes when round-tripped) is
+// an error rather than a silently altered value.
 func (v *Value) Canonical() ([]byte, error) {
+	var lossy error
+	v.Walk(func(_ []string, n *Value) {
+		if lossy == nil && n.kind == Number {
+			lossy = checkCanonicalNumber(n.raw)
+		}
+	})
+	if lossy != nil {
+		return nil, lossy
+	}
 	c := jsontext.Value(v.Encode())
 	if err := c.Canonicalize(); err != nil {
 		return nil, err
 	}
 	return c, nil
+}
+
+func checkCanonicalNumber(raw []byte) error {
+	lit := string(raw)
+	f, err := strconv.ParseFloat(lit, 64)
+	if math.IsInf(f, 0) {
+		return fmt.Errorf("jsondoc: number %s overflows float64 (RFC 8785)", lit)
+	}
+	if err != nil && !errors.Is(err, strconv.ErrRange) {
+		return fmt.Errorf("jsondoc: number %s: %w", lit, err)
+	}
+	if strings.ContainsAny(lit, ".eE") {
+		return nil
+	}
+	exact, ok := new(big.Int).SetString(lit, 10)
+	if !ok {
+		return fmt.Errorf("jsondoc: number %s is not an integer literal", lit)
+	}
+	if new(big.Int).Abs(exact).Cmp(big.NewInt(maxExactInt)) <= 0 {
+		return nil
+	}
+	round, _ := new(big.Float).SetFloat64(f).Int(nil)
+	if exact.Cmp(round) != 0 {
+		return fmt.Errorf("jsondoc: integer %s is not exactly representable as float64 (RFC 8785)", lit)
+	}
+	return nil
 }
 
 // Kind returns the value's type.
@@ -240,8 +283,16 @@ func (v *Value) Lookup(path ...string) *Value {
 	return cur
 }
 
-// Set replaces the named member's value, or appends the member.
+// Set replaces the named member's value, or appends the member. It panics if
+// v is not an object or val is nil: both are programmer errors that would
+// otherwise lose the member silently or fail later at Encode.
 func (v *Value) Set(name string, val *Value) {
+	if v == nil || v.kind != Object {
+		panic("jsondoc: Set on a value that is not an object")
+	}
+	if val == nil {
+		panic("jsondoc: Set with a nil value")
+	}
 	for i, m := range v.members {
 		if m.Name == name {
 			v.members[i].Value = val
@@ -251,11 +302,12 @@ func (v *Value) Set(name string, val *Value) {
 	v.members = append(v.members, Member{Name: name, Value: val})
 }
 
-// Delete removes the named member and reports whether it existed.
+// Delete removes the named member and reports whether it existed. It builds a
+// new slice, so a slice returned earlier by Members() is left intact.
 func (v *Value) Delete(name string) bool {
 	for i, m := range v.members {
 		if m.Name == name {
-			v.members = append(v.members[:i], v.members[i+1:]...)
+			v.members = append(v.members[:i:i], v.members[i+1:]...)
 			return true
 		}
 	}
