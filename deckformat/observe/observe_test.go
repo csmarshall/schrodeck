@@ -428,14 +428,74 @@ func TestNameValuePairsWithSecretNamesAreBlanked(t *testing.T) {
 	}
 }
 
-func TestUnresolvablePairParentFailsClosed(t *testing.T) {
+func TestUnresolvableChangeFailsClosed(t *testing.T) {
 	s := take(t, fixture.XL(), nil, t0)
-	c := semdiff.Change{Where: "page 1 › key 0,0", Path: "Settings.nowhere[3].value", Kind: semdiff.Modified, Before: `"a"`, After: `"b"`}
 	folder := ""
 	for f := range s.Profiles {
 		folder = f
 	}
-	if !siblingNamesSecret(folder, s, s, &c) {
-		t.Fatal("an unresolvable parent must be treated as secret")
+	rd := newRenderer(s, s, redactor(t))
+	for _, c := range []semdiff.Change{
+		{Where: "page 1 › key 0,0", Path: "Settings.nowhere[3].value", Before: `"a"`, After: `"b"`},
+		{Where: "page 1 › key 0,0", Path: `Settings.["unterminated`, Before: `"a"`, After: `"b"`},
+	} {
+		c := c
+		rd.render(folder, &c)
+		if c.Before != redact.Redacted || c.After != redact.Redacted {
+			t.Errorf("%q rendered %q → %q, want both blanked", c.Path, c.Before, c.After)
+		}
+	}
+}
+
+// TestRedactionAppliesInContext covers shapes no path rule names: the report
+// renders values out of whole redacted documents, so every rule in redact
+// applies in context.
+func TestRedactionAppliesInContext(t *testing.T) {
+	cases := []struct {
+		name         string
+		old, new     string
+		secrets      []string // must not appear in the report
+		visibleAfter string   // must appear (a non-secret sibling still changes)
+	}{
+		{"array under secret member", `{"auth":["arr-ONE"],"label":"a"}`, `{"auth":["arr-TWO"],"label":"b"}`, []string{"arr-ONE", "arr-TWO"}, `"b"`},
+		{"array of pairs", `[{"name":"token","value":"pair-ONE"},{"name":"color","value":"red"}]`, `[{"name":"token","value":"pair-TWO"},{"name":"color","value":"blue"}]`, []string{"pair-ONE", "pair-TWO"}, `"blue"`},
+		{"bearer in a plain setting", `{"h":"Authorization: Bearer bear-ONE","label":"a"}`, `{"h":"Authorization: Bearer bear-TWO","label":"b"}`, []string{"bear-ONE", "bear-TWO"}, `"b"`},
+		{"embedded pair", `{"cfg":"{\"items\":[{\"name\":\"token\",\"value\":\"emb-ONE\"}]}","label":"a"}`, `{"cfg":"{\"items\":[{\"name\":\"token\",\"value\":\"emb-TWO\"}]}","label":"b"}`, []string{"emb-ONE", "emb-TWO"}, `"b"`},
+		{"pair added", `{"items":[],"label":"a"}`, `{"items":[{"name":"password","value":"add-TWO"}],"label":"b"}`, []string{"add-TWO"}, `"b"`},
+		{"pair name and value both change", `{"items":[{"name":"x","value":"nv-ONE"}],"label":"a"}`, `{"items":[{"name":"token","value":"nv-TWO"}],"label":"b"}`, []string{"nv-TWO"}, `"b"`},
+		{"secret in a url query", `{"u":"https://x.test/?api_key=url-ONE","label":"a"}`, `{"u":"https://x.test/?api_key=url-TWO","label":"b"}`, []string{"url-ONE", "url-TWO"}, `"b"`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			before := take(t, settingsXL(t, tc.old), nil, t0)
+			after := take(t, settingsXL(t, tc.new), nil, t0.Add(time.Minute))
+			rep, err := Compare("ctx", before, after, redactor(t))
+			if err != nil {
+				t.Fatal(err)
+			}
+			out := rep.Markdown() + "\n" + rep.EvidenceRow()
+			raw, err := semdiff.Sets(before.Profiles, after.Profiles, semdiff.Raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var rawText strings.Builder
+			for _, c := range raw {
+				rawText.WriteString(c.String() + "\n")
+			}
+			for _, secret := range tc.secrets {
+				if strings.Contains(out, secret) {
+					t.Errorf("report leaks %q:\n%s", secret, out)
+				}
+				if !strings.Contains(rawText.String(), secret) {
+					t.Errorf("control: the raw diff lacks %q, so this proves nothing", secret)
+				}
+			}
+			if !strings.Contains(out, tc.visibleAfter) {
+				t.Errorf("non-secret change vanished:\n%s", out)
+			}
+			if !strings.Contains(out, redact.Redacted) {
+				t.Errorf("a changed secret must still leave a row showing %s:\n%s", redact.Redacted, out)
+			}
+		})
 	}
 }

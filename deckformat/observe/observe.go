@@ -208,9 +208,10 @@ type Report struct {
 // Compare diffs two snapshots (raw mode: runtime fields and ids included,
 // since that is what an observation is for) and redacts the result. Profile
 // names are user content, so the Profile column and added/removed profile
-// values carry the profile-N alias instead. A change whose path has any
-// secret-named member keeps no values at all (a bare scalar carries no name
-// for the redactor to judge), and so does one whose path cannot be parsed.
+// values carry the profile-N alias instead. Changes are detected on the raw
+// snapshots but rendered out of redacted copies of the whole documents (see
+// renderer), so a changed secret shows as <redacted> on both sides and the row
+// stays.
 func Compare(name string, before, after *Snapshot, r *redact.Redactor) (Report, error) {
 	ps := newPseudonyms(before, after)
 	folders := map[string]bool{}
@@ -255,15 +256,14 @@ func Compare(name string, before, after *Snapshot, r *redact.Redactor) (Report, 
 			changeFolder = append(changeFolder, "")
 		}
 	}
+	rd := newRenderer(before, after, r)
 	for i := range changes {
 		c := &changes[i]
 		if c.Where == "profile" && c.Path == "Name" {
 			// The profile's own name is user content: both sides become its alias.
 			c.Before, c.After = renamed(c.Before, c.Profile), renamed(c.After, c.Profile)
-		} else if blanksValues(c) || siblingNamesSecret(changeFolder[i], before, after, c) {
-			c.Before, c.After = blank(c.Before), blank(c.After)
 		} else {
-			c.Before, c.After = redactJSON(r, c.Before), redactJSON(r, c.After)
+			rd.render(changeFolder[i], c)
 		}
 		c.Profile, c.Where, c.Path = r.String(c.Profile), r.String(c.Where), r.String(c.Path)
 		c.Profile, c.Where, c.Path = ps.String(c.Profile), ps.String(c.Where), ps.String(c.Path)
@@ -278,34 +278,6 @@ func renamed(value, alias string) string {
 		return value
 	}
 	return alias + " (renamed)"
-}
-
-// blank replaces a present value by redact.Redacted.
-func blank(s string) string {
-	if s == "" {
-		return s
-	}
-	return redact.Redacted
-}
-
-// blanksValues reports whether a change's values must not be shown: some
-// member on its path is secret-named, or the path is not parseable (fail
-// closed). File and whole-profile changes carry digests and names, not
-// member paths.
-func blanksValues(c *semdiff.Change) bool {
-	if c.Where == "files" || c.Where == "profiles" {
-		return false
-	}
-	segs, err := semdiff.ParsePath(c.Path)
-	if err != nil {
-		return true
-	}
-	for _, sg := range segs {
-		if !sg.IsIndex && redact.IsSecretName(sg.Name) {
-			return true
-		}
-	}
-	return false
 }
 
 // uuidPattern matches a UUID in any letter case.
@@ -392,18 +364,6 @@ func (ps *pseudonyms) String(s string) string {
 	})
 }
 
-// redactJSON redacts a JSON fragment structurally when it parses (so secret
-// member names are honored), else as text.
-func redactJSON(r *redact.Redactor, s string) string {
-	if s == "" {
-		return s
-	}
-	if v, err := jsondoc.Parse([]byte(s)); err == nil {
-		return string(r.Value(v).Encode())
-	}
-	return r.String(s)
-}
-
 // escape makes s safe inside a Markdown table cell.
 func escape(s string) string {
 	return strings.ReplaceAll(strings.ReplaceAll(s, "|", `\|`), "\n", " ")
@@ -459,71 +419,85 @@ func (rep Report) EvidenceRow() string {
 		rep.Name, rep.AppVersion, rep.After.Format("2006-01-02"), escape(strings.Join(summary, "; ")), rep.Name, rep.Name)
 }
 
-// siblingNamesSecret handles the name/value pair shape, {"name":"token",
-// "value":"…"}, where the secret is a sibling of the changed leaf rather than
-// on its path. For a change whose last path segment is a member named "value"
-// it resolves the parent object in each snapshot of the profile (page changes
-// carry their path relative to the key slot named in Where, so every page
-// manifest is a candidate root) and reports true when a sibling "name" or
-// "key" holds a secret-like string, or when no parent can be resolved at all
-// (fail closed). A side on which the value is absent (added or removed) is
-// not searched.
-func siblingNamesSecret(folder string, before, after *Snapshot, c *semdiff.Change) bool {
+// renderer renders a change's Before/After out of REDACTED copies of the whole
+// documents the change was found in, so every rule in the redact package
+// (member names, name/value pairs, embedded JSON, URLs, bearer values) applies
+// in context instead of to a bare scalar that has lost its surroundings. The
+// change is detected on the raw snapshots; only its rendering is redacted.
+type renderer struct {
+	before, after *Snapshot
+	r             *redact.Redactor
+	memo          map[*jsondoc.Value]*jsondoc.Value // raw document → redacted copy
+}
+
+func newRenderer(before, after *Snapshot, r *redact.Redactor) *renderer {
+	return &renderer{before: before, after: after, r: r, memo: map[*jsondoc.Value]*jsondoc.Value{}}
+}
+
+func (rd *renderer) redacted(v *jsondoc.Value) *jsondoc.Value {
+	if red, ok := rd.memo[v]; ok {
+		return red
+	}
+	red := rd.r.Value(v)
+	rd.memo[v] = red
+	return red
+}
+
+// render replaces c.Before and c.After by their redacted renderings. A side
+// that has a value but cannot be found in the redacted document is blanked
+// (fail closed). File and whole-profile changes carry digests and aliases, not
+// document values, and are left alone.
+func (rd *renderer) render(folder string, c *semdiff.Change) {
 	if c.Where == "files" || c.Where == "profiles" {
-		return false
+		return
 	}
 	segs, err := semdiff.ParsePath(c.Path)
 	if err != nil {
-		return true
+		c.Before, c.After = blankSide(c.Before), blankSide(c.After)
+		return
 	}
-	if len(segs) == 0 || segs[len(segs)-1].IsIndex || !strings.EqualFold(segs[len(segs)-1].Name, "value") {
-		return false
-	}
-	parentPath := segs[:len(segs)-1]
-	slot := ""
-	if _, after, ok := strings.Cut(c.Where, " › "); ok {
-		if fields := strings.Fields(after); len(fields) == 2 {
-			slot = fields[1]
-		}
-	}
-	resolved := false
-	for _, side := range []struct {
-		snap    *Snapshot
-		present bool
-	}{{before, c.Before != ""}, {after, c.After != ""}} {
-		if !side.present {
-			continue
-		}
-		for _, root := range candidateRoots(side.snap, folder, c.Where, slot) {
-			parent := walk(root, parentPath)
-			if parent == nil || parent.Kind() != jsondoc.Object {
-				continue
-			}
-			resolved = true
-			for _, m := range parent.Members() {
-				if !strings.EqualFold(m.Name, "name") && !strings.EqualFold(m.Name, "key") {
-					continue
-				}
-				if str, ok := m.Value.Str(); ok && redact.IsSecretName(str) {
-					return true
-				}
-			}
-		}
-	}
-	return !resolved
+	c.Before = rd.side(rd.before, folder, c.Where, segs, c.Before)
+	c.After = rd.side(rd.after, folder, c.Where, segs, c.After)
 }
 
-// candidateRoots lists the JSON documents a change's path may be relative to.
-func candidateRoots(s *Snapshot, folder, where, slot string) []*jsondoc.Value {
-	switch {
-	case where == "prefs":
+func blankSide(s string) string {
+	if s == "" {
+		return s
+	}
+	return redact.Redacted
+}
+
+// side finds the node at segs in snapshot s whose raw encoding is raw and
+// returns the encoding of the same node in the redacted copy. Page changes
+// carry their path relative to the key slot named in Where, so every page's
+// slot is a candidate; matching on the raw encoding picks the right one.
+func (rd *renderer) side(s *Snapshot, folder, where string, segs []semdiff.Segment, raw string) string {
+	if raw == "" {
+		return ""
+	}
+	for _, root := range rd.roots(s, folder, where) {
+		rawNode, redNode := walkPair(root.raw, root.red, segs)
+		if rawNode != nil && string(rawNode.Encode()) == raw {
+			return string(redNode.Encode())
+		}
+	}
+	return redact.Redacted
+}
+
+type rootPair struct{ raw, red *jsondoc.Value }
+
+// roots lists the documents (raw and redacted) a change's path may be relative to.
+func (rd *renderer) roots(s *Snapshot, folder, where string) []rootPair {
+	pair := func(v *jsondoc.Value) rootPair { return rootPair{v, rd.redacted(v)} }
+	switch where {
+	case "prefs":
 		if s.Prefs != nil {
-			return []*jsondoc.Value{s.Prefs}
+			return []rootPair{pair(s.Prefs)}
 		}
 		return nil
-	case where == "profile":
+	case "profile":
 		if p := s.Profiles[folder]; p != nil {
-			return []*jsondoc.Value{p.Manifest}
+			return []rootPair{pair(p.Manifest)}
 		}
 		return nil
 	}
@@ -531,36 +505,56 @@ func candidateRoots(s *Snapshot, folder, where, slot string) []*jsondoc.Value {
 	if p == nil {
 		return nil
 	}
-	var roots []*jsondoc.Value
+	slot := ""
+	if _, rest, ok := strings.Cut(where, " › "); ok {
+		if fields := strings.Fields(rest); len(fields) == 2 {
+			slot = fields[1]
+		}
+	}
+	var roots []rootPair
 	for _, pg := range p.Pages {
+		page := pair(pg.Manifest)
 		if slot == "" {
-			roots = append(roots, pg.Manifest)
+			roots = append(roots, page)
 			continue
 		}
-		for _, ctl := range pg.Manifest.Get("Controllers").Items() {
-			if action := ctl.Get("Actions").Get(slot); action != nil {
-				roots = append(roots, action)
+		for i := range pg.Manifest.Get("Controllers").Items() {
+			prefix := []semdiff.Segment{{Name: "Controllers"}, {Index: i, IsIndex: true}, {Name: "Actions"}, {Name: slot}}
+			if raw, red := walkPair(page.raw, page.red, prefix); raw != nil {
+				roots = append(roots, rootPair{raw, red})
 			}
 		}
 	}
 	return roots
 }
 
-// walk follows segments from v, returning nil when the path does not exist.
-func walk(v *jsondoc.Value, segs []semdiff.Segment) *jsondoc.Value {
+// walkPair follows segs through a raw document and its redacted copy in step,
+// by position, because redaction may rename members. It returns nil, nil when
+// the path does not exist.
+func walkPair(raw, red *jsondoc.Value, segs []semdiff.Segment) (*jsondoc.Value, *jsondoc.Value) {
 	for _, sg := range segs {
-		if v == nil {
-			return nil
+		if raw == nil || red == nil {
+			return nil, nil
 		}
 		if sg.IsIndex {
-			items := v.Items()
-			if sg.Index >= len(items) {
-				return nil
+			ri, di := raw.Items(), red.Items()
+			if sg.Index >= len(ri) || sg.Index >= len(di) {
+				return nil, nil
 			}
-			v = items[sg.Index]
-		} else {
-			v = v.Get(sg.Name)
+			raw, red = ri[sg.Index], di[sg.Index]
+			continue
+		}
+		rm, dm := raw.Members(), red.Members()
+		found := false
+		for i, m := range rm {
+			if m.Name == sg.Name && i < len(dm) {
+				raw, red, found = m.Value, dm[i].Value, true
+				break
+			}
+		}
+		if !found {
+			return nil, nil
 		}
 	}
-	return v
+	return raw, red
 }
