@@ -191,11 +191,25 @@ func Load(fsys fs.FS, folder string) (*Profile, error) {
 // LoadResult is every profile found in a ProfilesV3-shaped file system.
 type LoadResult struct {
 	Profiles []*Profile
-	// Errors holds one error per profile that failed to load.
+	// Errors holds one error per profile that failed to load, each a
+	// *FolderError naming the folder (errors.As still reaches the cause, such
+	// as an *UnexpectedFileError).
 	Errors []error
 	// Skipped lists top-level entries that are not profile folders.
 	Skipped []string
 }
+
+// FolderError is a profile folder that exists but failed to load. Its message
+// is the cause's, unchanged.
+type FolderError struct {
+	Folder string
+	Err    error
+}
+
+func (e *FolderError) Error() string { return e.Err.Error() }
+
+// Unwrap returns the cause.
+func (e *FolderError) Unwrap() error { return e.Err }
 
 // LoadAll loads every *.sdProfile folder at the root of fsys. One broken
 // profile does not hide the others.
@@ -212,7 +226,7 @@ func LoadAll(fsys fs.FS) (LoadResult, error) {
 		}
 		p, err := Load(fsys, e.Name())
 		if err != nil {
-			res.Errors = append(res.Errors, err)
+			res.Errors = append(res.Errors, &FolderError{Folder: e.Name(), Err: err})
 			continue
 		}
 		res.Profiles = append(res.Profiles, p)

@@ -60,7 +60,12 @@ func p1(in Install) (Status, string, []string) {
 	if len(in.Load.Profiles) == 0 && len(in.Load.Errors) == 0 {
 		return Skip, "no profiles found", nil
 	}
-	return Pass, fmt.Sprintf("%d profile(s) load", len(in.Load.Profiles)), nil
+	detail := fmt.Sprintf("%d profile(s) load", len(in.Load.Profiles))
+	if n := len(in.Load.Errors); n > 0 {
+		// Every remaining error is an allow-list failure, which P7 reports.
+		detail += fmt.Sprintf(", %d excluded, see P7", n)
+	}
+	return Pass, detail, nil
 }
 
 func p2(in Install) (Status, string, []string) {
@@ -79,8 +84,15 @@ func p2(in Install) (Status, string, []string) {
 func p3(in Install) (Status, string, []string) {
 	var ev []string
 	for _, p := range in.Load.Profiles {
-		if p.DeviceUUID() == "" || p.DeviceModel() == "" {
-			ev = append(ev, p.Folder+": Device.UUID or Device.Model missing")
+		var missing []string
+		if p.DeviceUUID() == "" {
+			missing = append(missing, "Device.UUID")
+		}
+		if p.DeviceModel() == "" {
+			missing = append(missing, "Device.Model")
+		}
+		if len(missing) > 0 {
+			ev = append(ev, p.Folder+": "+strings.Join(missing, " and ")+" missing")
 		}
 	}
 	if len(ev) > 0 {
@@ -122,7 +134,10 @@ func forEachSetting(p *profile.Profile, fn func(where, value string)) {
 
 func p6(in Install) (Status, string, []string) {
 	var ev []string
-	home := filepath.Clean(in.Home)
+	// APFS is case-insensitive, so letter case does not move a path out of
+	// {{HOME}}. Comparison is by whole path element: /Users/<user>2 is not
+	// under /Users/<user>.
+	home := strings.ToLower(filepath.Clean(in.Home))
 	for _, p := range in.Load.Profiles {
 		for _, key := range p.SortedPageKeys() {
 			for _, c := range p.Pages[key].Manifest.Get("Controllers").Items() {
@@ -134,7 +149,8 @@ func p6(in Install) (Status, string, []string) {
 					if !ok || !filepath.IsAbs(path) {
 						continue
 					}
-					if home == "." || (path != home && !strings.HasPrefix(path, home+string(filepath.Separator))) {
+					lower := strings.ToLower(filepath.Clean(path))
+					if home == "." || (lower != home && !strings.HasPrefix(lower, home+string(filepath.Separator))) {
 						ev = append(ev, fmt.Sprintf("%s › key %s: %s", p.Folder, m.Name, path))
 					}
 				}
@@ -148,21 +164,33 @@ func p6(in Install) (Status, string, []string) {
 }
 
 func p8(in Install) (Status, string, []string) {
+	// Folder ids are matched case-insensitively: folders are upper-case on
+	// disk, references lower-case. A profile that exists but failed to load is
+	// still a reference target, so its folder is listed too.
+	id := func(folder string) string { return strings.ToLower(strings.TrimSuffix(folder, profile.Suffix)) }
 	folders := map[string]string{}
 	for _, p := range in.Load.Profiles {
-		folders[strings.ToLower(strings.TrimSuffix(p.Folder, profile.Suffix))] = p.Folder
+		folders[id(p.Folder)] = p.Folder
+	}
+	for _, err := range in.Load.Errors {
+		var fe *profile.FolderError
+		if errors.As(err, &fe) {
+			folders[id(fe.Folder)] = fe.Folder + " (which failed to load)"
+		}
 	}
 	var ev []string
 	for _, p := range in.Load.Profiles {
 		own := p.DeviceUUID()
-		self := strings.ToLower(strings.TrimSuffix(p.Folder, profile.Suffix))
+		self := id(p.Folder)
 		forEachSetting(p, func(where, s string) {
 			if uuidShape.MatchString(s) {
 				if target, ok := folders[strings.ToLower(s)]; ok && strings.ToLower(s) != self {
 					ev = append(ev, where+": references profile "+target)
 				}
 			}
-			if strings.Contains(s, "@(") && !strings.Contains(s, own) {
+			// A profile without a device of its own has no id to exclude: an
+			// empty own id would match every string.
+			if strings.Contains(s, "@(") && (own == "" || !strings.Contains(s, own)) {
 				ev = append(ev, where+": embeds a device id that is not this profile's own")
 			}
 		})
