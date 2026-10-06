@@ -20,7 +20,9 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/csmarshall/schrodeck/deckformat/jsondoc"
 	"github.com/csmarshall/schrodeck/deckformat/pathguard"
@@ -59,6 +61,30 @@ type Options struct {
 // Redactor applies the rules.
 type Redactor struct {
 	literals []literal
+	serials  []*regexp.Regexp
+
+	// Each distinct serial gets its own placeholder, numbered in order of first
+	// appearance: <deck>, <deck2>, <deck3>. Two decks therefore never collapse
+	// into one member name, and a serial seen bare maps like the id carrying it.
+	mu    sync.Mutex
+	decks map[string]string
+}
+
+// deckFor returns the placeholder for a serial, assigning the next one on first
+// sight. Serials compare case-insensitively.
+func (r *Redactor) deckFor(serial string) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	key := strings.ToLower(serial)
+	if ph, ok := r.decks[key]; ok {
+		return ph
+	}
+	ph := Deck
+	if n := len(r.decks) + 1; n > 1 {
+		ph = Deck[:len(Deck)-1] + strconv.Itoa(n) + ">"
+	}
+	r.decks[key] = ph
+	return ph
 }
 
 type literal struct {
@@ -69,7 +95,7 @@ type literal struct {
 // New builds a redactor. Names shorter than 3 characters are refused rather
 // than redacted everywhere they occur as a substring.
 func New(o Options) (*Redactor, error) {
-	r := &Redactor{}
+	r := &Redactor{decks: map[string]string{}}
 	add := func(names []string, placeholder string) error {
 		for _, n := range names {
 			if n == "" {
@@ -88,8 +114,14 @@ func New(o Options) (*Redactor, error) {
 	if err := add(o.UserNames, User); err != nil {
 		return nil, err
 	}
-	if err := add(o.Serials, Deck); err != nil {
-		return nil, err
+	for _, n := range o.Serials {
+		if n == "" {
+			continue
+		}
+		if len(n) < 3 {
+			return nil, fmt.Errorf("redact: %q is too short to redact safely", n)
+		}
+		r.serials = append(r.serials, regexp.MustCompile(`(?i)`+regexp.QuoteMeta(n)))
 	}
 	// Longest first, so "alice-mbp" is replaced before "alice".
 	sort.SliceStable(r.literals, func(i, j int) bool {
@@ -118,10 +150,16 @@ func SerialsFrom(ids ...string) []string {
 
 // String redacts one string.
 func (r *Redactor) String(s string) string {
-	s = deviceID.ReplaceAllString(s, "@($1)[$2/$3/"+Deck+"]")
+	s = deviceID.ReplaceAllStringFunc(s, func(id string) string {
+		m := deviceID.FindStringSubmatch(id)
+		return "@(" + m[1] + ")[" + m[2] + "/" + m[3] + "/" + r.deckFor(deviceSerial.FindStringSubmatch(id)[1]) + "]"
+	})
 	s = homeDir.ReplaceAllString(s, "${1}"+User)
 	for _, l := range r.literals {
 		s = l.re.ReplaceAllString(s, l.placeholder)
+	}
+	for _, re := range r.serials {
+		s = re.ReplaceAllStringFunc(s, r.deckFor)
 	}
 	return s
 }
@@ -230,21 +268,39 @@ func ExportFixture(p *profile.Profile, r *Redactor, sourceRoot, outDir, folder s
 	if entries, err := os.ReadDir(resolvedOut); err == nil && len(entries) > 0 {
 		return ErrOutputExists
 	}
-	for rel, data := range p.Files() {
+	// Redact and re-parse every manifest before anything is written: a manifest
+	// that no longer parses (for example two member names redacted into one)
+	// must fail the export, not land on disk. Paths are sorted so that numbered
+	// placeholders are assigned in a deterministic order.
+	files := p.Files()
+	rels := make([]string, 0, len(files))
+	for rel := range files {
+		rels = append(rels, rel)
+	}
+	sort.Strings(rels)
+	redacted := make(map[string][]byte, len(files))
+	for _, rel := range rels {
+		data := files[rel]
 		if strings.HasSuffix(rel, "manifest.json") {
 			doc, err := jsondoc.Parse(data)
 			if err != nil {
 				return fmt.Errorf("%s: %w", rel, err)
 			}
 			data = r.Value(doc).Encode()
+			if _, err := jsondoc.Parse(data); err != nil {
+				return fmt.Errorf("redact: %s does not parse after redaction, nothing written: %w", rel, err)
+			}
 		} else {
 			data = SyntheticPNG(data)
 		}
+		redacted[rel] = data
+	}
+	for _, rel := range rels {
 		target := filepath.Join(finalTarget, filepath.FromSlash(rel))
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 			return err
 		}
-		if err := os.WriteFile(target, data, 0o644); err != nil {
+		if err := os.WriteFile(target, redacted[rel], 0o644); err != nil {
 			return err
 		}
 	}

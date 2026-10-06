@@ -266,3 +266,47 @@ func TestStringsListsEverythingForReview(t *testing.T) {
 		}
 	}
 }
+
+func TestDistinctSerialsGetDistinctPlaceholders(t *testing.T) {
+	other := "@(1)[4057/143/" + "ZZ99" + "YY88XX]"
+	r, err := New(Options{Serials: SerialsFrom(realDevice, other)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := `{"` + realDevice + `":1,"` + other + `":2,"s":"` + strings.ToLower(realSerial) + ` and ` + "ZZ99" + `YY88XX"}`
+	v, err := jsondoc.Parse([]byte(in))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := r.Value(v).Encode()
+	want := `{"@(1)[4057/143/<deck>]":1,"@(1)[4057/143/<deck2>]":2,"s":"<deck> and <deck2>"}`
+	if string(out) != want {
+		t.Fatalf("got\n%s\nwant\n%s", out, want)
+	}
+	if _, err := jsondoc.Parse(out); err != nil {
+		t.Fatalf("redacted output does not parse: %v", err)
+	}
+	// Stable within one Redactor: the same serial keeps its placeholder.
+	if got := r.String(other); got != "@(1)[4057/143/<deck2>]" {
+		t.Fatalf("second sighting changed placeholder: %s", got)
+	}
+}
+
+// Known-bad for the export-side check: two member names that redaction maps to
+// one name. The export must fail, name the file, and write nothing.
+func TestExportRefusesManifestThatStopsParsing(t *testing.T) {
+	src := fixture.XL()
+	src.Pages[0].Buttons[0].Settings = `{"Alice":1,"alice":2}`
+	p, err := profile.Load(src.FS(), src.Folder())
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := t.TempDir()
+	err = ExportFixture(p, newR(t), "", out, "F.sdProfile")
+	if err == nil || !strings.Contains(err.Error(), "manifest.json") || !strings.Contains(err.Error(), "does not parse") {
+		t.Fatalf("collision not refused with the file named: %v", err)
+	}
+	if entries, _ := os.ReadDir(out); len(entries) != 0 {
+		t.Fatalf("a refused export wrote files: %v", entries)
+	}
+}
