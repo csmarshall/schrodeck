@@ -815,3 +815,53 @@ func TestExportWithoutRootsFailsClosed(t *testing.T) {
 		t.Fatalf("control: export with a real root = %v", err)
 	}
 }
+
+func TestOddDeviceKeysAreMasked(t *testing.T) {
+	r, err := New(Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct{ in, want string }{
+		{"@(2)[" + "KK11JJ22HH" + "]", "@(2)[<key>]"},
+		{"@(0)[ab:" + "CD12" + "]", "@(0)[ab:<key2>]"},
+		{"@(1)[" + "PP33OO44" + "]", "@(1)[<key3>]"},
+		{`Devices.["@(2)[` + "KK11JJ22HH" + `]"].DeviceName`, `Devices.["@(2)[<key>]"].DeviceName`}, // same value, same placeholder
+		// Controls: a well-formed id keeps the serial rule, the virtual key and
+		// an already-redacted key are unchanged.
+		{"@(1)[4057/143/<deck>]", "@(1)[4057/143/<deck>]"},
+		{"@(0)[]", "@(0)[]"},
+		{"@(2)[<key>]", "@(2)[<key>]"},
+	} {
+		if got := r.String(c.in); got != c.want {
+			t.Errorf("String(%q) = %q, want %q", c.in, got, c.want)
+		}
+		if got := r.String(r.String(c.in)); got != c.want {
+			t.Errorf("redacting %q twice gave %q", c.in, got)
+		}
+	}
+}
+
+func TestKeyName(t *testing.T) {
+	r, err := New(Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct{ in, want string }{
+		{"Dev-" + "MM55NN66", "Dev-<id>"},
+		{"x_" + "abc123", "x_<id2>"},
+		{"Dev-" + "MM55NN66" + "/again", "Dev-<id>/again"}, // same token, same placeholder
+		{"@(2)[" + "KK11JJ22HH" + "]", "@(2)[<key>]"},      // String's rules apply too
+		// Controls: words stay readable, short or single-kind tokens stay.
+		{"ESDProfilesPreferred", "ESDProfilesPreferred"},
+		{"abc12", "abc12"},
+		{"20260101", "20260101"},
+		{"@(1)[4057/143/<deck>]", "@(1)[4057/143/<deck>]"},
+	} {
+		if got := r.KeyName(c.in); got != c.want {
+			t.Errorf("KeyName(%q) = %q, want %q", c.in, got, c.want)
+		}
+		if got := r.KeyName(r.KeyName(c.in)); got != c.want {
+			t.Errorf("KeyName twice on %q gave %q", c.in, got)
+		}
+	}
+}

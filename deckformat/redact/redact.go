@@ -76,6 +76,21 @@ var (
 	keyValue = regexp.MustCompile(`([A-Za-z0-9_-]+)(["']?)([ \t]*[:=][ \t]*)("(?:[^"\\]|\\.)*"|'[^']*'|[^\s"',;&<>{}\[\]()]+)`)
 	// An already-redacted serial, so redacting twice does not renumber it.
 	deckPlaceholder = regexp.MustCompile(`^<deck\d*>$`)
+	// Any device-key shape "@(<type>)[<body>]", well-formed or not: the app
+	// may use key forms nobody has observed yet (U5, U7), and their bodies can
+	// carry serials the vendor/product/serial rule does not reach.
+	anyDeviceKey = regexp.MustCompile(`@\((\d+)\)\[([^\]"\n]*)\]`)
+	// A body the serial rule has already redacted: vendor/product/<deckN>.
+	redactedDeviceBody = regexp.MustCompile(`^\d+/\d+/<deck\d*>$`)
+	// Tokens inside an odd key body: a placeholder (kept) or a run of three or
+	// more letters and digits (masked).
+	keyBodyToken = regexp.MustCompile(`<[a-z]+\d*>|[A-Za-z0-9]{3,}`)
+	// Tokens in a member name (KeyName): a placeholder (kept) or a run of six
+	// or more letters and digits (masked when it mixes both).
+	keyNameToken   = regexp.MustCompile(`<[a-z]+\d*>|[A-Za-z0-9]{6,}`)
+	anyPlaceholder = regexp.MustCompile(`^<[a-z]+\d*>$`)
+	hasLetter      = regexp.MustCompile(`[A-Za-z]`)
+	hasDigit       = regexp.MustCompile(`[0-9]`)
 )
 
 // IsSecretName reports whether a member name says its value is a secret.
@@ -145,6 +160,62 @@ type Redactor struct {
 	mu    sync.Mutex
 	decks map[string]string
 	uuids map[string]string
+	// Odd device-key bodies (<key>, <key2>, …) and mixed tokens in member
+	// names (<id>, <id2>, …), numbered in order of first sight, case-sensitive.
+	keys map[string]string
+	ids  map[string]string
+}
+
+// numbered returns the placeholder for value in m ("<name>", then
+// "<name2>", …), assigning the next one on first sight.
+func (r *Redactor) numbered(m map[string]string, name, value string) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if ph, ok := m[value]; ok {
+		return ph
+	}
+	ph := "<" + name + ">"
+	if n := len(m) + 1; n > 1 {
+		ph = "<" + name + strconv.Itoa(n) + ">"
+	}
+	m[value] = ph
+	return ph
+}
+
+// maskOddDeviceKeys masks the body of every device key that is not in
+// vendor/product/serial form (those are handled by the serial rule): each run
+// of three or more letters and digits becomes <key>, <key2>, …, while the
+// "@(n)[", "]" and punctuation are kept so the key's shape stays visible.
+func (r *Redactor) maskOddDeviceKeys(s string) string {
+	return anyDeviceKey.ReplaceAllStringFunc(s, func(k string) string {
+		m := anyDeviceKey.FindStringSubmatch(k)
+		body := m[2]
+		if body == "" || redactedDeviceBody.MatchString(body) {
+			return k
+		}
+		body = keyBodyToken.ReplaceAllStringFunc(body, func(tok string) string {
+			if anyPlaceholder.MatchString(tok) {
+				return tok
+			}
+			return r.numbered(r.keys, "key", tok)
+		})
+		return "@(" + m[1] + ")[" + body + "]"
+	})
+}
+
+// KeyName redacts a member name whose shape is unknown, such as a prefs
+// Devices entry that is not a device record (U7): String's rules apply, and
+// then every token of six or more characters that mixes letters and digits
+// becomes <id>, <id2>, … (an identifier or serial, by its look). Words of
+// letters only, such as "ESDProfilesPreferred", and plain numbers stay readable.
+func (r *Redactor) KeyName(s string) string {
+	s = r.String(s)
+	return keyNameToken.ReplaceAllStringFunc(s, func(tok string) string {
+		if anyPlaceholder.MatchString(tok) || !hasLetter.MatchString(tok) || !hasDigit.MatchString(tok) {
+			return tok
+		}
+		return r.numbered(r.ids, "id", tok)
+	})
 }
 
 // deckFor returns the placeholder for a serial, assigning the next one on first
@@ -224,7 +295,7 @@ type literal struct {
 // New builds a redactor. Names shorter than 3 characters are refused rather
 // than redacted everywhere they occur as a substring.
 func New(o Options) (*Redactor, error) {
-	r := &Redactor{decks: map[string]string{}, uuids: map[string]string{}}
+	r := &Redactor{decks: map[string]string{}, uuids: map[string]string{}, keys: map[string]string{}, ids: map[string]string{}}
 	add := func(names []string, placeholder string) error {
 		for _, n := range names {
 			if n == "" {
@@ -300,6 +371,7 @@ func (r *Redactor) String(s string) string {
 		m := deviceID.FindStringSubmatch(id)
 		return "@(" + m[1] + ")[" + m[2] + "/" + m[3] + "/" + r.deckFor(deviceSerial.FindStringSubmatch(id)[1]) + "]"
 	})
+	s = r.maskOddDeviceKeys(s)
 	s = homeDir.ReplaceAllString(s, "${1}"+User)
 	s = homeDirEnc.ReplaceAllString(s, "${1}"+User)
 	s = bearerValue.ReplaceAllString(s, "Bearer "+Redacted)

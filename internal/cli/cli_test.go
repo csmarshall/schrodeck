@@ -1094,3 +1094,63 @@ func TestFixtureProfileMustBeSingleName(t *testing.T) {
 		t.Fatalf("a --profile path was not refused as a usage error: exit %d %q", code, errb.String())
 	}
 }
+
+// oddKeysHost has device records whose keys are not @(n)[vendor/product/serial].
+func oddKeysHost(t *testing.T) (*host.Host, []string) {
+	t.Helper()
+	h := fakeHost(t)
+	secrets := []string{"KK11" + "JJ22HH", "PP33" + "OO44", "MM55" + "NN66", "QQ77" + "RR88"}
+	prefs := h.Prefs.(fake.Prefs)
+	prefs.Records = append(append([]map[string]any{}, prefs.Records...),
+		map[string]any{decks.RecordKey: "@(2)[" + secrets[0] + "]"},
+		map[string]any{decks.RecordKey: "@(1)[" + secrets[1] + "]"},
+		map[string]any{decks.RecordKey: "Dev-" + secrets[2]},
+		map[string]any{decks.RecordKey: "Raw-" + secrets[3], decks.RecordRaw: "v"},
+		map[string]any{decks.RecordKey: "ESDSettings", decks.RecordRaw: "v"},
+	)
+	h.Prefs = prefs
+	return h, secrets
+}
+
+func TestOddDeviceKeysAreMaskedInCommands(t *testing.T) {
+	h, secrets := oddKeysHost(t)
+	for _, args := range [][]string{{"inventory"}, {"inventory", "--json"}, {"doctor"}, {"doctor", "--json"}} {
+		env, out, _ := testEnv(nil, h)
+		Run(context.Background(), args, env)
+		for _, s := range secrets {
+			if strings.Contains(out.String(), s) {
+				t.Errorf("%q printed %s:\n%s", args, s, out.String())
+			}
+		}
+		// Controls: the well-formed id and a plain word key stay readable.
+		if !strings.Contains(out.String(), "@(2)[<key") || (args[0] == "inventory" && !strings.Contains(out.String(), "ESDSettings")) {
+			t.Errorf("%q lost the key shape or a readable key:\n%s", args, out.String())
+		}
+		if args[0] == "inventory" && !strings.Contains(out.String(), fixture.Device) {
+			t.Errorf("%q changed the well-formed device id:\n%s", args, out.String())
+		}
+	}
+}
+
+func TestOddDeviceKeysAreMaskedInReportPaths(t *testing.T) {
+	h := fakeHost(t)
+	odd := "@(2)[" + "KK11" + "JJ22HH" + "]"
+	set := func(name string) {
+		prefs := h.Prefs.(fake.Prefs)
+		prefs.Records = []map[string]any{{decks.RecordKey: fixture.Device}, {decks.RecordKey: odd, "DeviceName": name}}
+		h.Prefs = prefs
+	}
+	set("before")
+	env, _, _ := testEnv(nil, h)
+	if code := Run(context.Background(), []string{"observe", "start", "u0-oddkey"}, env); code != ExitOK {
+		t.Fatal("start failed")
+	}
+	set("after")
+	env, out, errb := testEnv(nil, h)
+	if code := Run(context.Background(), []string{"observe", "stop", "u0-oddkey"}, env); code != ExitOK {
+		t.Fatalf("stop: exit %d %s", code, errb.String())
+	}
+	if strings.Contains(out.String(), "JJ22HH") || !strings.Contains(out.String(), `Devices.["@(2)[<key>]"].DeviceName | modified | "before" | "after"`) {
+		t.Fatalf("report path carries the odd key or lost the change:\n%s", out.String())
+	}
+}

@@ -322,6 +322,15 @@ func runInventory(_ context.Context, env Env, args []string) (result, error) {
 		}
 		return r.String(s)
 	}
+	// showKey is show for a prefs key of unknown shape (unrecognised, unmatched
+	// or raw entries): KeyName also masks identifier-looking tokens outside the
+	// @(n)[…] form, e.g. "Dev-<id>".
+	showKey := func(s string) string {
+		if *showIDs {
+			return s
+		}
+		return r.KeyName(s)
+	}
 	id, err := identity.HostID(h.Identity)
 	if err != nil {
 		return result{}, err
@@ -374,16 +383,16 @@ func runInventory(_ context.Context, env Env, args []string) (result, error) {
 	if recs, err := h.Prefs.DeviceRecords(); err == nil {
 		profs, keys := decks.Unmatched(recs, res.Profiles)
 		for i := range keys {
-			keys[i] = show(keys[i])
+			keys[i] = showKey(keys[i])
 		}
 		if len(profs) > 0 || len(keys) > 0 {
 			d.Unmatched = &unmatched{Profiles: profs, Decks: keys}
 		}
 		for _, u := range decks.Unrecognised(recs, res.Profiles) {
-			d.Unrecognised = append(d.Unrecognised, unrecognisedInfo{Key: show(u.Key), Profiles: u.Profiles})
+			d.Unrecognised = append(d.Unrecognised, unrecognisedInfo{Key: showKey(u.Key), Profiles: u.Profiles})
 		}
 		for _, e := range decks.RawEntries(recs) {
-			d.RawPrefs = append(d.RawPrefs, rawPrefInfo{Key: show(e.Key), Type: e.Type})
+			d.RawPrefs = append(d.RawPrefs, rawPrefInfo{Key: showKey(e.Key), Type: e.Type})
 		}
 	}
 
@@ -520,12 +529,13 @@ func runDoctor(ctx context.Context, env Env, args []string) (result, error) {
 		}
 	}
 
+	redactCheck := checkRedactor(h, r)
 	var text strings.Builder
 	for i := range d.Checks {
 		c := &d.Checks[i]
-		c.Detail = r.String(c.Detail)
+		c.Detail = redactCheck(c.Detail)
 		for j := range c.Evidence {
-			c.Evidence[j] = r.String(c.Evidence[j])
+			c.Evidence[j] = redactCheck(c.Evidence[j])
 		}
 		fmt.Fprintf(&text, "%-4s %-6s %s %s\n", c.Status, c.ID, c.Contract, c.Detail)
 		for _, e := range c.Evidence {
@@ -540,6 +550,32 @@ func runDoctor(ctx context.Context, env Env, args []string) (result, error) {
 		fmt.Fprintf(&text, "Fingerprint NOT accepted: %s.\n", d.AcceptRefused)
 	}
 	return result{data: d, text: text.String(), failed: probe.Failed(d.Checks)}, nil
+}
+
+// checkRedactor redacts doctor's details and evidence. Evidence quotes prefs
+// device keys verbatim (M2), and a key of unknown shape ("Dev-…") is outside
+// String's reach, so each record key is first replaced by its KeyName form.
+func checkRedactor(h *host.Host, r *redact.Redactor) func(string) string {
+	var keys []string
+	if recs, err := h.Prefs.DeviceRecords(); err == nil {
+		for _, rec := range recs {
+			if k, ok := rec[decks.RecordKey].(string); ok && k != "" {
+				keys = append(keys, k)
+			}
+		}
+	}
+	// Longest first, so a key that contains another is replaced whole.
+	sort.Slice(keys, func(i, j int) bool { return len(keys[i]) > len(keys[j]) })
+	masked := make([]string, len(keys))
+	for i, k := range keys {
+		masked[i] = r.KeyName(k)
+	}
+	return func(s string) string {
+		for i, k := range keys {
+			s = strings.ReplaceAll(s, k, masked[i])
+		}
+		return r.String(s)
+	}
 }
 
 // fingerprint is ADR 0015's format fingerprint over every loaded profile.
