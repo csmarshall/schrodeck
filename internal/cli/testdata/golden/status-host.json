@@ -1,0 +1,1 @@
+{"schema_version":1,"command":"status","ok":true,"data":{"schrodeck_version":"test","host":{"host_id":"7db4c9ba0faa","app":{"installed":true,"running":false,"version":"7.5.1"},"decks":1,"profiles":1}}}

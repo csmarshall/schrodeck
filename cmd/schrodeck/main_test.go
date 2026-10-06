@@ -47,7 +47,9 @@ func runBinary(t *testing.T, bin, logLevel string, args ...string) (stdout, stde
 
 func TestBinaryDebugLogsStayOffStdout(t *testing.T) {
 	bin := buildBinary(t)
-	stdout, stderr, code := runBinary(t, bin, "debug", "doctor", "--json")
+	// version, not doctor: doctor would read this computer's real Stream Deck
+	// install, which tests never do by default.
+	stdout, stderr, code := runBinary(t, bin, "debug", "version", "--json")
 	if code != cli.ExitOK {
 		t.Fatalf("exit %d, stderr %q", code, stderr)
 	}

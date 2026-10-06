@@ -1,0 +1,1 @@
+{"schema_version":1,"command":"doctor","ok":false,"error":{"message":"this command needs an OS connector, and there is none for this OS yet"}}

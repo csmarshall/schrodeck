@@ -75,10 +75,10 @@ Invariants: `Quit` must be **graceful**, so the app flushes its in-memory state 
 type Deck struct {
     AppDeviceID      string   // key of this deck in the app's prefs device list; local only; the deck_key of ADR 0026
     ManifestDeviceID string   // the Device.UUID value the app writes into profiles bound to this deck; what {{DEVICE}} expands to (ADR 0006)
-    Geometry         Geometry // columns, rows, dials (from Elgato's DeviceType table [R8](../references.md))
+    Geometry         Geometry // columns, rows, dials: the DeviceType's documented key and dial counts (R8) with an observed grid split; see ADR 0003
     Model      string
     Virtual    bool
-    SerialHash string // optional, informational (ADR 0003); "" if unknown
+    SerialHash string // optional (ADR 0003); "" if unknown. Derived from the deck serial: treat it as an identifier, never log or print it
 }
 type DeviceEnumerator interface { Decks() ([]Deck, error) }
 ```
@@ -86,19 +86,23 @@ Source: the app's own device list (prefs + manifests), not USB. Same on every OS
 
 Invariants: the adapter returns every deck, even when two share an `AppDeviceID` (e.g. two virtual decks with the empty id). The core then refuses to target either of them (ADR [0026](../adr/0026-profile-identity.md), review F31). Whether `AppDeviceID` and `ManifestDeviceID` are always the same string is **unverified** (they have the same shape on one Mac); the adapter must return both, and the round-trip probe ([contract B](client-os.md) M4) checks that an installed profile is bound to the intended deck.
 
+Geometry keying (2026-10-02, M1): a physical deck's DeviceType comes from its USB (vendor, product), read from its device key, through an observed product → DeviceType map; its key and dial counts come from R8, and its columns × rows split is observed and must multiply to R8's key count. A product without an observed mapping, or a type without an observed grid, has no geometry, so the deck is not a destination.
+
 ### 5. `AppPrefs`: app version and per-deck selected profile (read-only)
 
 ```go
 type AppPrefs interface {
     AppVersion() (string, error)              // for the schema guard (ADR 0015)
     SelectedProfile(appDeviceID string) (string, error) // ESDProfilesPreferred [R14](../references.md); read-only, never written (ADR 0019)
-    DeviceRecords() ([]map[string]any, error) // raw device entries, for DeviceEnumerator
+    DeviceRecords() ([]map[string]any, error) // raw device entries, for DeviceEnumerator; each carries its prefs key under "_key", and an entry that is not a dictionary is returned as {"_key": key, "_raw": value}
 }
 ```
 | | macOS | Windows (unverified) |
 |---|---|---|
 | Store | `~/Library/Preferences/com.elgato.StreamDeck.plist` | registry `HKCU\Software\Elgato Systems GmbH\StreamDeck` (the at-scale article uses this key [R3](../references.md)) |
 | AppVersion | app bundle `Info.plist` `CFBundleShortVersionString` | file version of `StreamDeck.exe` |
+
+Observed on macOS (2026-10-02): the `Devices` dictionary also holds one entry whose value is a string, not a device record. The connector keeps it visible as `_raw` (for observations) and the deck list skips it; `inventory` lists it by key and value type only (U7). Record values are JSON-friendly: plist dates become RFC 3339 UTC strings, and plist data becomes `data:<length>:<first 12 hex of its sha256>`, never the bytes, so a report shows whether a blob changed without carrying it.
 
 ### 6. `Watcher`: change notification
 
@@ -179,6 +183,7 @@ Every connector must pass the shared **conformance suite**: tests written once a
 - `Watcher`: a write produces an event; a write three directory levels deep produces an event (known-bad: a non-recursive watcher fails); a burst within the debounce window produces one event.
 - `StoreSync`: a local non-synced file returns `Unknown` (known-bad control); a provider file returns a non-Unknown state.
 - `HostIdentity`: stable across two calls and two processes; differs across two users on one host.
+  The "differs across two users" case is verified at the derivation level (`TestHostID`), because CI has no second OS user.
 - Filesystem guarantees: rename-aside/rename-in under a concurrent reader; the lock excludes a second process; journal fsync survives a simulated crash (kill between steps).
 
 A connector that can't pass a test documents why, and what the core does instead (e.g. `Notifier.Available() == false`).

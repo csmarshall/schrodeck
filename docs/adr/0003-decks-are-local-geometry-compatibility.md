@@ -1,6 +1,6 @@
 # 0003. Decks are local; compatibility is by geometry
 
-Status: Accepted 2026-10-01
+Status: Accepted 2026-10-01. Revised 2026-10-02 (M1, implementation): R8 documents key and dial counts per DeviceType but not the columns × rows split; a physical deck's DeviceType is found through an observed USB product → DeviceType map, and the split is observed and checked against R8's key count. Virtual decks remain in scope; their grid source (U8) is settled in M1.
 
 ## Context
 
@@ -8,7 +8,7 @@ Each Stream Deck profile is bound to one device ([R10](../references.md), docume
 
 Observed on one Mac (app 7.5.1): the app records each deck it knows in its preferences (`Devices`, keyed by its device id), and each profile manifest carries `Device.Model` and `Device.UUID`. For a physical deck, `Device.UUID` has the shape `@(1)[<vendor>/<product>/<serial>]` and contains the deck's USB serial ([R9](../references.md), observed; the SDK only calls the id a "unique identifier"). Virtual decks have the id `@(0)[]`, with no serial ([R12](../references.md)).
 
-Elgato documents a DeviceType table with key-grid sizes (columns × rows, plus dials/encoders on some models) ([R8](../references.md), documented).
+Elgato documents a DeviceType table with each model's key count and dial count ([R8](../references.md), documented); the columns × rows split is not tabulated and is observed.
 
 ## Decision
 
@@ -35,12 +35,12 @@ Elgato documents a DeviceType table with key-grid sizes (columns × rows, plus d
 ## Verified by
 
 No check yet; to be written in the plan:
-- A geometry-table test that fails if a known DeviceType lacks columns/rows.
+- A geometry-table test that fails if a mapped DeviceType lacks columns/rows, or if a grid does not multiply to R8's key count: `TestGeometryTablesAreConsistent` (M1 Task 10), with known-bad tables.
 - A subscribe test that fails when binding a 32-key profile to a 15-key deck.
 
 ## References
 
-- [R8](../references.md): DeviceType table with columns × rows (documented)
+- [R8](../references.md): DeviceType table with key and dial counts (documented); columns × rows are observed
 - [R9](../references.md): `Device.UUID` contains the USB serial (observed, one deck, one Mac)
 - [R10](../references.md): profiles are device-specific (documented)
 - [R12](../references.md): virtual decks, id `@(0)[]` (documented / observed)

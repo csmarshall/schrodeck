@@ -42,7 +42,11 @@ Revised 2026-10-02 (issue #5, owner's decision): heads are per **member copy** (
 
 `profile_id` is a random UUIDv4 assigned by `share` (ADR [0026](../adr/0026-profile-identity.md)). `host_id` is defined in ADR [0010](../adr/0010-host-identity-and-config-layering.md).
 
+`host_id` and `copy_id` are lower-case text wherever they appear (paths and records): `host_id` is 12 lower-case hex digits, the leading part of `sha256(hardware id + ":" + user name)`, and `copy_id` is a lower-case hyphenated UUID (8-4-4-4-12). Writers emit exactly that form and readers compare it exactly; only the canonical profile folder name is upper case, as the app names its folders.
+
 `copy_id` names one **member copy**: `uuid5(NAMESPACE_SCHRODECK, host_id + ":" + profile_id + ":" + deck_key)` (ADR [0026](../adr/0026-profile-identity.md)). A host can hold several member copies of one profile, one per chosen deck, so heads are kept per copy (issue #5). `deck_key` embeds the deck's USB serial ([R9](../references.md)), so it never appears in a store path or record; only this one-way hash of it does. `copy_id` is opaque but not secret: someone who already knows the `host_id`, the `profile_id` and a candidate serial could confirm the guess, which is acceptable for a folder only the user's own machines replicate. It includes `host_id` so the same physical deck behind a switch gets a different `copy_id` on each Mac, and the store doesn't reveal which hosts share a deck. Heads are grouped under `heads/<host_id>/` so the single writer stays visible in the path and `forget-host` removes one directory. Everything in a `copy_id` is known to the host after losing its local state, so it can find its heads again (ADR [0005](../adr/0005-direction-detection-three-way-hash.md) Recover).
+
+`NAMESPACE_SCHRODECK` = `uuid5(NameSpace_URL, "https://github.com/csmarshall/schrodeck/ns/v1")` = `5a7d742c-c29c-52c8-b996-ed8ccdcb83f8` (RFC 9562 name-based UUIDs). It is derived from that URL rather than chosen at random, and the URL carries a version: a different namespace would change every `copy_id` and canonical folder, so it can only change with a store `FORMAT` migration. The canonical folder name is that UUID in **upper case** plus `.sdProfile`, matching how the app names profile folders. Implemented in `internal/identity`.
 
 ## Records
 
